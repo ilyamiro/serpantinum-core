@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::message::Header;
 use zbus::zvariant::Value;
 use zbus::{fdo, interface};
@@ -14,6 +15,7 @@ use zbus::{fdo, interface};
 use crate::brightness::{self, Backend, Change, Ddc};
 use crate::clipboard;
 use crate::compositor::{self, Session, Waker};
+use crate::idle::{self, Event, Inhibition, SleepLock};
 use crate::leases::Leases;
 use crate::locks::{self, Locks};
 use crate::sysinfo::{Sampler, Usage};
@@ -28,6 +30,8 @@ pub const CLIPBOARD_PATH: &str = "/clipboard";
 pub const CLIPBOARD_INTERFACE: &str = "org.serpantinum.Core.Clipboard";
 pub const BRIGHTNESS_PATH: &str = "/brightness";
 pub const BRIGHTNESS_INTERFACE: &str = "org.serpantinum.Core.Brightness";
+pub const IDLE_PATH: &str = "/idle";
+pub const IDLE_INTERFACE: &str = "org.serpantinum.Core.Idle";
 pub const COMPOSITOR_PATH: &str = "/compositor";
 pub const COMPOSITOR_INTERFACE: &str = "org.serpantinum.Core.Compositor";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
@@ -448,6 +452,150 @@ fn drain(fd: &OwnedFd) {
     while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
 }
 
+#[derive(Default)]
+struct IdleState {
+    inhibition: Inhibition,
+    marker: PathBuf,
+    sleep_lock: bool,
+    logs: Vec<String>,
+    published: bool,
+}
+
+pub struct IdleFeed {
+    pub leases: Leases,
+    state: Mutex<IdleState>,
+    events: Mutex<std::sync::mpsc::Sender<Event>>,
+    receiver: Mutex<Option<std::sync::mpsc::Receiver<Event>>>,
+}
+
+impl IdleFeed {
+    pub fn new() -> Arc<IdleFeed> {
+        let (events, receiver) = std::sync::mpsc::channel();
+        Arc::new(IdleFeed {
+            leases: Leases::default(),
+            state: Mutex::default(),
+            events: Mutex::new(events),
+            receiver: Mutex::new(Some(receiver)),
+        })
+    }
+
+    fn notify(&self, event: Event) {
+        let _ = self.events.lock().unwrap().send(event);
+    }
+
+    fn log(&self, line: String) {
+        self.state.lock().unwrap().logs.push(line);
+        self.notify(Event::Changed);
+    }
+
+    /// A client left the bus: its lease and its inhibitors end
+    pub fn remove(&self, owner: &str) {
+        self.leases.remove(owner);
+        self.state.lock().unwrap().inhibition.cookies.drop_owner(owner);
+        self.notify(Event::Changed);
+    }
+
+    fn signal(bus: &zbus::blocking::Connection, member: &str, text: Option<&str>) {
+        let sent = match text {
+            Some(text) => bus.emit_signal(None::<&str>, IDLE_PATH, IDLE_INTERFACE, member, &(text,)),
+            None => bus.emit_signal(None::<&str>, IDLE_PATH, IDLE_INTERFACE, member, &()),
+        };
+        if let Err(error) = sent {
+            eprintln!("serpantinum-core: could not signal {member}: {error}");
+        }
+    }
+
+    /// Signals the inhibition when it changed and the log lines gathered meanwhile
+    fn publish(&self, bus: &zbus::blocking::Connection) {
+        let (inhibited, before, logs) = {
+            let mut state = self.state.lock().unwrap();
+            let inhibited = state.inhibition.inhibited(Instant::now());
+            let before = std::mem::replace(&mut state.published, inhibited);
+            (inhibited, before, std::mem::take(&mut state.logs))
+        };
+        for line in logs {
+            Self::signal(bus, "Log", Some(&line));
+        }
+        if inhibited != before {
+            emit(bus, IDLE_PATH, IDLE_INTERFACE, HashMap::from([("Inhibited", Value::from(inhibited))]));
+        }
+    }
+
+    /// Owns org.freedesktop.ScreenSaver and keeps the sleep lock while anyone watches
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        let receiver = self.receiver.lock().unwrap().take().expect("the idle feed runs once");
+        let events = self.events.lock().unwrap().clone();
+        self.follow_screensaver_name(bus, events.clone());
+        let mut sleep = SleepLock::default();
+        loop {
+            self.leases.wait_interval();
+            let flags = RequestNameFlags::AllowReplacement | RequestNameFlags::ReplaceExisting;
+            let owner =
+                matches!(bus.request_name_with_flags(idle::SCREENSAVER, flags), Ok(RequestNameReply::PrimaryOwner));
+            self.state.lock().unwrap().inhibition.owner = owner;
+            while self.leases.active() {
+                let (enabled, marker) = {
+                    let state = self.state.lock().unwrap();
+                    (state.sleep_lock, state.marker.clone())
+                };
+                sleep.set_enabled(enabled, &events);
+                sleep.tick(&marker, &events);
+                self.publish(bus);
+                let now = Instant::now();
+                let deadline =
+                    [self.state.lock().unwrap().inhibition.deadline(now), sleep.deadline()].into_iter().flatten().min();
+                let event = match deadline {
+                    Some(at) => receiver.recv_timeout(at.saturating_duration_since(now)).ok(),
+                    None => receiver.recv().ok(),
+                };
+                match event {
+                    Some(Event::PrepareForSleep(sleeping)) if sleep.prepare_for_sleep(sleeping) => {
+                        Self::signal(bus, if sleeping { "Sleep" } else { "Wake" }, None);
+                    }
+                    Some(Event::SystemLost) => sleep.lost(),
+                    Some(Event::ScreenSaverOwned(owned)) => {
+                        let mut state = self.state.lock().unwrap();
+                        state.inhibition.owner = owned;
+                        if !owned {
+                            state.inhibition.reset();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let _ = bus.release_name(idle::SCREENSAVER);
+            sleep.set_enabled(false, &events);
+            {
+                let mut state = self.state.lock().unwrap();
+                state.inhibition.reset();
+                state.inhibition.owner = false;
+                state.sleep_lock = false;
+            }
+            self.publish(bus);
+        }
+    }
+
+    fn follow_screensaver_name(&self, bus: &zbus::blocking::Connection, events: std::sync::mpsc::Sender<Event>) {
+        let Ok(proxy) = zbus::blocking::fdo::DBusProxy::new(bus) else { return };
+        let (Ok(acquired), Ok(lost)) = (proxy.receive_name_acquired(), proxy.receive_name_lost()) else { return };
+        let other = events.clone();
+        std::thread::spawn(move || {
+            for signal in acquired {
+                if signal.args().is_ok_and(|a| a.name() == idle::SCREENSAVER) {
+                    let _ = other.send(Event::ScreenSaverOwned(true));
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            for signal in lost {
+                if signal.args().is_ok_and(|a| a.name() == idle::SCREENSAVER) {
+                    let _ = events.send(Event::ScreenSaverOwned(false));
+                }
+            }
+        });
+    }
+}
+
 pub struct Core;
 
 #[interface(name = "org.serpantinum.Core")]
@@ -614,6 +762,84 @@ impl BrightnessControl {
     #[zbus(property)]
     fn ready(&self) -> bool {
         self.0.state.lock().unwrap().ready
+    }
+}
+
+pub struct Idle(pub Arc<IdleFeed>);
+
+#[interface(name = "org.serpantinum.Core.Idle")]
+impl Idle {
+    /// Serves org.freedesktop.ScreenSaver until this client unsubscribes. `marker` is the file the
+    /// lock screen creates, which lets a held-back sleep go on.
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>, marker: String) -> fdo::Result<()> {
+        self.0.state.lock().unwrap().marker = marker.into();
+        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
+        self.0.notify(Event::Changed);
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    /// Holds sleep back until the screen is locked, and signals `Sleep` and `Wake`
+    fn set_sleep_lock(&self, enabled: bool) {
+        self.0.state.lock().unwrap().sleep_lock = enabled;
+        self.0.notify(Event::Changed);
+    }
+
+    /// Whether an app asks the session not to idle
+    #[zbus(property)]
+    fn inhibited(&self) -> bool {
+        self.0.state.lock().unwrap().inhibition.inhibited(Instant::now())
+    }
+}
+
+#[derive(Clone)]
+pub struct ScreenSaver(pub Arc<IdleFeed>);
+
+#[interface(name = "org.freedesktop.ScreenSaver")]
+impl ScreenSaver {
+    fn inhibit(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        application_name: String,
+        reason_for_inhibit: String,
+    ) -> fdo::Result<u32> {
+        let sender = owner(&header)?;
+        let cookie = self.0.state.lock().unwrap().inhibition.cookies.add(&sender);
+        self.0.log(format!("inhibit {cookie} from {sender} ({application_name}: {reason_for_inhibit})"));
+        Ok(cookie)
+    }
+
+    fn un_inhibit(&self, cookie: u32) {
+        if self.0.state.lock().unwrap().inhibition.cookies.remove(cookie) {
+            self.0.log(format!("uninhibit {cookie}"));
+        } else {
+            self.0.notify(Event::Changed);
+        }
+    }
+
+    fn simulate_user_activity(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        let sender = owner(&header)?;
+        let now = Instant::now();
+        let quiet = {
+            let mut state = self.0.state.lock().unwrap();
+            let quiet = state.inhibition.deadline(now).is_none();
+            state.inhibition.activity_until = Some(now + idle::ACTIVITY_HOLD);
+            quiet
+        };
+        if quiet {
+            self.0.log(format!("user activity from {sender}"));
+        } else {
+            self.0.notify(Event::Changed);
+        }
+        Ok(())
+    }
+
+    fn get_active(&self) -> bool {
+        false
     }
 }
 

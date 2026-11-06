@@ -22,7 +22,8 @@ use zbus::zvariant::Value;
 use crate::compositor::Session;
 use crate::dbus::{
     BRIGHTNESS_INTERFACE, BRIGHTNESS_PATH, BUS_NAME, CLIPBOARD_INTERFACE, CLIPBOARD_PATH, COMPOSITOR_INTERFACE,
-    COMPOSITOR_PATH, CORE_INTERFACE, LOCKS_INTERFACE, LOCKS_PATH, SYSINFO_INTERFACE, SYSINFO_PATH,
+    COMPOSITOR_PATH, CORE_INTERFACE, IDLE_INTERFACE, IDLE_PATH, LOCKS_INTERFACE, LOCKS_PATH, SYSINFO_INTERFACE,
+    SYSINFO_PATH,
 };
 
 pub const USAGE: &str = "\
@@ -40,6 +41,11 @@ Commands:
   watch compositor              Print the workspaces, windows and keyboard layout of Sway, Niri or
                                 Mango now and on every change
   watch brightness              Print the brightness in percent and its backend now and on every change
+  watch idle MARKER             Serve org.freedesktop.ScreenSaver while running and print
+                                \"inhibit 1\" or \"inhibit 0\" when apps start or stop inhibiting idle,
+                                \"sleep\" and \"wake\" around sleep, and \"log ...\" lines. Reads
+                                \"sleep-lock on|off\" lines: when on, sleep waits up to 4 seconds
+                                for the file MARKER, which the lock screen creates
   brightness [get]              Print the brightness in percent, or -1 when there is nothing to read
   brightness set PERCENT        Set the brightness
   brightness raise|lower        Raise or lower the brightness by 5 percent
@@ -157,6 +163,7 @@ fn command(args: &[String]) -> Result<()> {
         ["watch", "compositor"] => watch(COMPOSITOR_PATH, COMPOSITOR_INTERFACE, Lease::Session),
         ["watch", "brightness"] => watch(BRIGHTNESS_PATH, BRIGHTNESS_INTERFACE, Lease::Plain),
         ["brightness", rest @ ..] => brightness(rest),
+        ["watch", "idle", marker] => watch_idle(marker),
         ["clipboard", rest @ ..] => clipboard(rest, options.get("cache-dir").copied()),
         [] => Err(usage("no command")),
         _ => Err(usage(format!("unknown command: {}", positional.join(" ")))),
@@ -365,6 +372,104 @@ fn watch(path: &'static str, interface: &'static str, lease: Lease) -> Result<()
         }
         if state.1 {
             print(&Json::Object(state.0.clone()).to_string());
+        }
+    }
+    Err(failed("lost the session bus"))
+}
+
+/// The shell's idle helper protocol on stdin and stdout, served by the daemon while this runs
+fn watch_idle(marker: &str) -> Result<()> {
+    // SAFETY: prctl with PR_SET_PDEATHSIG only sets a flag of this process
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+    let conn = connect()?;
+    start(&conn)?;
+    let proxy = Proxy::new(&conn, BUS_NAME, IDLE_PATH, IDLE_INTERFACE)?;
+    let rule =
+        zbus::MatchRule::builder().msg_type(zbus::message::Type::Signal).sender(BUS_NAME)?.path(IDLE_PATH)?.build();
+    let signals = zbus::blocking::MessageIterator::for_match_rule(rule, &conn, None)?;
+    let owners = DBusProxy::new(&conn)?.receive_name_owner_changed_with_args(&[(0, BUS_NAME)])?;
+
+    let shown: Arc<Mutex<Option<bool>>> = Arc::default();
+    let show = {
+        let shown = shown.clone();
+        move |inhibited: bool| {
+            let mut shown = shown.lock().unwrap();
+            if *shown != Some(inhibited) {
+                *shown = Some(inhibited);
+                print(if inhibited { "inhibit 1" } else { "inhibit 0" });
+            }
+        }
+    };
+    let sleep_lock: Arc<Mutex<Option<bool>>> = Arc::default();
+    let marker = marker.to_owned();
+    let resubscribe = {
+        let (proxy, sleep_lock, show) = (proxy.clone(), sleep_lock.clone(), show.clone());
+        move || -> Result<()> {
+            proxy.call_method("Subscribe", &(marker.as_str(),))?;
+            if let Some(on) = *sleep_lock.lock().unwrap() {
+                proxy.call_method("SetSleepLock", &(on,))?;
+            }
+            show(proxy.get_property::<bool>("Inhibited")?);
+            Ok(())
+        }
+    };
+    resubscribe()?;
+
+    let restarter = conn.clone();
+    std::thread::spawn(move || {
+        for signal in owners {
+            let Ok(args) = signal.args() else { continue };
+            let outcome = if args.new_owner().is_some() {
+                resubscribe()
+            } else {
+                sleep(RESTART_DELAY);
+                start(&restarter)
+            };
+            if let Err(Error::Failed(message) | Error::Usage(message)) = outcome {
+                eprintln!("serpantinum-core: {message}");
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            let Ok(line) = line else { break };
+            let on = match line.trim() {
+                "sleep-lock on" => true,
+                "sleep-lock off" => false,
+                _ => continue,
+            };
+            *sleep_lock.lock().unwrap() = Some(on);
+            if let Err(error) = proxy.call_method("SetSleepLock", &(on,)) {
+                eprintln!("serpantinum-core: {error}");
+            }
+        }
+        // The shell closed the pipe, so it is gone
+        std::process::exit(0);
+    });
+
+    for message in signals.flatten() {
+        let header = message.header();
+        match header.member().map(|m| m.as_str()) {
+            Some("Sleep") => print("sleep"),
+            Some("Wake") => print("wake"),
+            Some("Log") => {
+                if let Ok(line) = message.body().deserialize::<String>() {
+                    print(&format!("log {line}"));
+                }
+            }
+            Some("PropertiesChanged") => {
+                let body = message.body();
+                let Ok((_, changed, _)) =
+                    body.deserialize::<(String, HashMap<String, zbus::zvariant::Value>, Vec<String>)>()
+                else {
+                    continue;
+                };
+                if let Some(Value::Bool(inhibited)) = changed.get("Inhibited") {
+                    show(*inhibited);
+                }
+            }
+            _ => {}
         }
     }
     Err(failed("lost the session bus"))
