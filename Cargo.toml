@@ -1,0 +1,22 @@
+[package]
+name = "serpantinum-core"
+version = "0.1.0"
+edition = "2024"
+description = "A core of services for Serpantinum shell in Rust."
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/ilyamiro/serpantinum-core"
+
+[dependencies]
+blocking = "1"
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
+serde_json = "1"
+zbus = "5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
