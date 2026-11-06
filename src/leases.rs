@@ -33,6 +33,10 @@ impl Leases {
         }
     }
 
+    pub fn active(&self) -> bool {
+        !self.state.lock().unwrap().owners.is_empty()
+    }
+
     /// Blocks while there is no lease, then returns the shortest interval asked for
     pub fn wait_interval(&self) -> Duration {
         let state = self.changed.wait_while(self.state.lock().unwrap(), |s| s.owners.is_empty()).unwrap();

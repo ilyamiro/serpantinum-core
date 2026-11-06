@@ -19,9 +19,10 @@ use zbus::names::{BusName, InterfaceName};
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::Value;
 
+use crate::compositor::Session;
 use crate::dbus::{
-    BUS_NAME, CLIPBOARD_INTERFACE, CLIPBOARD_PATH, CORE_INTERFACE, LOCKS_INTERFACE, LOCKS_PATH, SYSINFO_INTERFACE,
-    SYSINFO_PATH,
+    BUS_NAME, CLIPBOARD_INTERFACE, CLIPBOARD_PATH, COMPOSITOR_INTERFACE, COMPOSITOR_PATH, CORE_INTERFACE,
+    LOCKS_INTERFACE, LOCKS_PATH, SYSINFO_INTERFACE, SYSINFO_PATH,
 };
 
 pub const USAGE: &str = "\
@@ -36,6 +37,8 @@ Commands:
   sysinfo                       Print one sample of CPU, memory, temperature, network and disk usage
   watch sysinfo [--interval S]  Print a sample every S seconds (default 2) until stopped
   watch locks                   Print Caps Lock and Num Lock now and on every change
+  watch compositor              Print the workspaces, windows and keyboard layout of Sway, Niri or
+                                Mango now and on every change
   clipboard list OFFSET LIMIT   Print a page of the clipboard history
   clipboard pin ID              Pin or unpin an entry
   clipboard delete ID           Delete an entry
@@ -52,6 +55,17 @@ const WAIT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 const LOCKS_INTERVAL: Duration = Duration::from_millis(250);
+/// Properties served as JSON text, printed as the JSON they hold
+const JSON_PROPERTIES: &[&str] = &["Workspaces", "Windows", "Keyboard"];
+/// Properties that steer the output instead of being part of it
+const HIDDEN_PROPERTIES: &[&str] = &["Samples", "Ready"];
+
+/// How a watcher holds its lease
+#[derive(Clone, Copy)]
+enum Lease {
+    Every(Duration),
+    Session,
+}
 
 #[derive(Debug)]
 enum Error {
@@ -131,9 +145,10 @@ fn command(args: &[String]) -> Result<()> {
                 None => Some(2.0),
             }
             .ok_or_else(|| usage("--interval takes a number of seconds"))?;
-            watch(SYSINFO_PATH, SYSINFO_INTERFACE, Duration::from_secs_f64(seconds))
+            watch(SYSINFO_PATH, SYSINFO_INTERFACE, Lease::Every(Duration::from_secs_f64(seconds)))
         }
-        ["watch", "locks"] => watch(LOCKS_PATH, LOCKS_INTERFACE, LOCKS_INTERVAL),
+        ["watch", "locks"] => watch(LOCKS_PATH, LOCKS_INTERFACE, Lease::Every(LOCKS_INTERVAL)),
+        ["watch", "compositor"] => watch(COMPOSITOR_PATH, COMPOSITOR_INTERFACE, Lease::Session),
         ["clipboard", rest @ ..] => clipboard(rest, options.get("cache-dir").copied()),
         [] => Err(usage("no command")),
         _ => Err(usage(format!("unknown command: {}", positional.join(" ")))),
@@ -202,8 +217,9 @@ fn json_key(name: &str) -> String {
     chars.next().map(|first| first.to_lowercase().chain(chars).collect()).unwrap_or_default()
 }
 
-fn json_value(value: &Value) -> Json {
+fn json_value(name: &str, value: &Value) -> Json {
     match value {
+        Value::Str(s) if JSON_PROPERTIES.contains(&name) => serde_json::from_str(s.as_str()).unwrap_or(Json::Null),
         Value::Bool(b) => (*b).into(),
         Value::U32(n) => (*n).into(),
         Value::U64(n) => (*n).into(),
@@ -216,8 +232,8 @@ fn json_value(value: &Value) -> Json {
 
 fn merge<'a>(state: &mut Map<String, Json>, values: impl IntoIterator<Item = (&'a str, &'a Value<'a>)>) {
     for (name, value) in values {
-        if name != "Samples" {
-            state.insert(json_key(name), json_value(value));
+        if !HIDDEN_PROPERTIES.contains(&name) {
+            state.insert(json_key(name), json_value(name, value));
         }
     }
 }
@@ -239,17 +255,27 @@ fn properties<'a>(conn: &Connection, path: &'a str) -> Result<PropertiesProxy<'a
 }
 
 /// The properties, and whether they are current: a sampled feed holds the last sample taken, maybe
-/// long ago, until the fresh one a subscription brings
+/// long ago, until the fresh one a subscription brings, and a feed with `Ready` is current once it
+/// says so
 fn snapshot(props: &PropertiesProxy, interface: &str) -> Result<(Map<String, Json>, bool)> {
     let all = props.get_all(InterfaceName::try_from(interface)?)?;
     let mut state = Map::new();
     merge(&mut state, all.iter().map(|(name, value)| (name.as_str(), &**value)));
-    Ok((state, !all.contains_key("Samples")))
+    let ready = all.get("Ready").is_none_or(|v| **v == Value::Bool(true));
+    Ok((state, ready && !all.contains_key("Samples")))
 }
 
-fn subscribe(conn: &Connection, path: &str, interface: &str, every: Duration) -> Result<()> {
-    let milliseconds = u32::try_from(every.as_millis()).unwrap_or(u32::MAX);
-    Proxy::new(conn, BUS_NAME, path, interface)?.call_method("Subscribe", &(milliseconds,))?;
+fn subscribe(conn: &Connection, path: &str, interface: &str, lease: Lease) -> Result<()> {
+    let proxy = Proxy::new(conn, BUS_NAME, path, interface)?;
+    match lease {
+        Lease::Every(every) => {
+            let milliseconds = u32::try_from(every.as_millis()).unwrap_or(u32::MAX);
+            proxy.call_method("Subscribe", &(milliseconds,))?;
+        }
+        Lease::Session => {
+            proxy.call_method("Subscribe", &(Session::from_env().vars(),))?;
+        }
+    }
     Ok(())
 }
 
@@ -267,7 +293,7 @@ fn sysinfo() -> Result<()> {
             }
         }
     });
-    subscribe(&conn, SYSINFO_PATH, SYSINFO_INTERFACE, WAIT)?;
+    subscribe(&conn, SYSINFO_PATH, SYSINFO_INTERFACE, Lease::Every(WAIT))?;
     let _ = wait.recv_timeout(WAIT + Duration::from_secs(1));
     print(&Json::Object(snapshot(&props, SYSINFO_INTERFACE)?.0).to_string());
     Ok(())
@@ -275,24 +301,24 @@ fn sysinfo() -> Result<()> {
 
 /// Prints the properties now and after every change. When the daemon goes away it is started
 /// again, and the lease taken again.
-fn watch(path: &'static str, interface: &'static str, every: Duration) -> Result<()> {
+fn watch(path: &'static str, interface: &'static str, lease: Lease) -> Result<()> {
     let conn = connect()?;
     start(&conn)?;
     let props = properties(&conn, path)?;
     let changes = props.receive_properties_changed()?;
     let owners = DBusProxy::new(&conn)?.receive_name_owner_changed_with_args(&[(0, BUS_NAME)])?;
 
-    let state = Arc::new(Mutex::new(Map::new()));
+    let state = Arc::new(Mutex::new((Map::new(), false)));
     let resubscribe = {
         let (conn, state) = (conn.clone(), state.clone());
         move || -> Result<()> {
             let props = properties(&conn, path)?;
-            subscribe(&conn, path, interface, every)?;
+            subscribe(&conn, path, interface, lease)?;
             let mut state = state.lock().unwrap();
-            let current;
-            (*state, current) = snapshot(&props, interface)?;
+            let (values, current) = snapshot(&props, interface)?;
+            *state = (values, current || !matches!(lease, Lease::Session));
             if current {
-                print(&Json::Object(state.clone()).to_string());
+                print(&Json::Object(state.0.clone()).to_string());
             }
             Ok(())
         }
@@ -320,9 +346,15 @@ fn watch(path: &'static str, interface: &'static str, every: Duration) -> Result
         if args.interface_name().as_str() != interface {
             continue;
         }
+        let changed = args.changed_properties();
         let mut state = state.lock().unwrap();
-        merge(&mut state, args.changed_properties().iter().map(|(name, value)| (*name, value)));
-        print(&Json::Object(state.clone()).to_string());
+        merge(&mut state.0, changed.iter().map(|(name, value)| (*name, value)));
+        if let Some(Value::Bool(ready)) = changed.get("Ready") {
+            state.1 = *ready;
+        }
+        if state.1 {
+            print(&Json::Object(state.0.clone()).to_string());
+        }
     }
     Err(failed("lost the session bus"))
 }
@@ -385,8 +417,16 @@ mod tests {
     #[test]
     fn the_sample_counter_stays_out_of_the_output() {
         let mut state = Map::new();
-        let (cpu, samples) = (Value::U32(7), Value::U64(3));
-        merge(&mut state, [("Cpu", &cpu), ("Samples", &samples)]);
+        let (cpu, samples, ready) = (Value::U32(7), Value::U64(3), Value::Bool(true));
+        merge(&mut state, [("Cpu", &cpu), ("Samples", &samples), ("Ready", &ready)]);
         assert_eq!(Json::Object(state).to_string(), r#"{"cpu":7}"#);
+    }
+
+    #[test]
+    fn json_properties_are_printed_as_json() {
+        let mut state = Map::new();
+        let (windows, name) = (Value::from(r#"[{"id":1}]"#), Value::from("[sway]"));
+        merge(&mut state, [("Windows", &windows), ("Name", &name)]);
+        assert_eq!(Json::Object(state).to_string(), r#"{"name":"[sway]","windows":[{"id":1}]}"#);
     }
 }

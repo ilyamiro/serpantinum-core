@@ -11,6 +11,7 @@ use zbus::zvariant::Value;
 use zbus::{fdo, interface};
 
 use crate::clipboard;
+use crate::compositor::{self, Session, Waker};
 use crate::leases::Leases;
 use crate::locks::{self, Locks};
 use crate::sysinfo::{Sampler, Usage};
@@ -23,10 +24,14 @@ pub const LOCKS_PATH: &str = "/locks";
 pub const LOCKS_INTERFACE: &str = "org.serpantinum.Core.Locks";
 pub const CLIPBOARD_PATH: &str = "/clipboard";
 pub const CLIPBOARD_INTERFACE: &str = "org.serpantinum.Core.Clipboard";
+pub const COMPOSITOR_PATH: &str = "/compositor";
+pub const COMPOSITOR_INTERFACE: &str = "org.serpantinum.Core.Compositor";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const MIN_INTERVAL: Duration = Duration::from_millis(100);
 const PRIMING: Duration = Duration::from_millis(250);
 const DEVICE_SETTLE: Duration = Duration::from_millis(500);
+/// How long to wait before connecting again to a compositor that went away
+const RECONNECT: Duration = Duration::from_secs(1);
 /// How often the polled LEDs are looked up again, in case a keyboard came without a device event
 const LED_RESCAN: Duration = Duration::from_secs(30);
 
@@ -202,6 +207,120 @@ impl LockFeed {
     }
 }
 
+#[derive(Default)]
+struct CompositorState {
+    name: String,
+    ready: bool,
+    state: compositor::State,
+}
+
+impl CompositorState {
+    fn properties(&self) -> Properties {
+        let text = |json: &serde_json::Value| Value::from(json.to_string());
+        vec![
+            ("Name", self.name.clone().into()),
+            ("Ready", self.ready.into()),
+            ("Workspaces", text(&self.state.workspaces)),
+            ("Windows", text(&self.state.windows)),
+            ("Keyboard", text(&self.state.keyboard)),
+        ]
+    }
+}
+
+pub struct CompositorFeed {
+    pub leases: Leases,
+    session: Mutex<Session>,
+    waker: Waker,
+    state: Mutex<CompositorState>,
+}
+
+impl CompositorFeed {
+    pub fn new() -> Arc<CompositorFeed> {
+        Arc::new(CompositorFeed {
+            leases: Leases::default(),
+            session: Mutex::new(Session::from_env()),
+            waker: Waker::new(),
+            state: Mutex::default(),
+        })
+    }
+
+    pub fn remove(&self, owner: &str) {
+        self.leases.remove(owner);
+        self.waker.wake();
+    }
+
+    fn publish(&self, bus: &zbus::blocking::Connection, update: impl FnOnce(&mut CompositorState)) {
+        let changes = {
+            let mut state = self.state.lock().unwrap();
+            let before = state.properties();
+            update(&mut state);
+            changed(before, state.properties())
+        };
+        emit(bus, COMPOSITOR_PATH, COMPOSITOR_INTERFACE, changes);
+    }
+
+    /// Follows the compositor of the latest session while anyone watches, and connects again a
+    /// second after it goes away
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        loop {
+            self.leases.wait_interval();
+            let session = self.session.lock().unwrap().clone();
+            let name = session.compositor();
+            match compositor::connect(&session) {
+                Some(Ok(adapter)) => self.follow(adapter, &session, bus),
+                Some(Err(error)) => eprintln!("serpantinum-core: cannot follow {name}: {error}"),
+                None => {
+                    self.publish(bus, |s| {
+                        *s = CompositorState { name: name.to_owned(), ready: true, ..Default::default() }
+                    });
+                    self.wait_while(&session, &[]);
+                    continue;
+                }
+            }
+            self.publish(bus, |s| s.ready = false);
+            if self.current(&session) {
+                self.leases.sleep(RECONNECT);
+            }
+        }
+    }
+
+    fn current(&self, session: &Session) -> bool {
+        self.leases.active() && *self.session.lock().unwrap() == *session
+    }
+
+    /// Waits on `fds` and the waker while the session is current; the indices of readable `fds`
+    fn wait_while(&self, session: &Session, fds: &[i32]) -> Option<Vec<usize>> {
+        let mut all = fds.to_vec();
+        all.push(self.waker.fd());
+        loop {
+            if !self.current(session) {
+                return None;
+            }
+            let revents = locks::wait_readable(&all)?;
+            if revents[fds.len()] != 0 {
+                self.waker.drain();
+                continue;
+            }
+            return Some((0..fds.len()).filter(|i| revents[*i] != 0).collect());
+        }
+    }
+
+    fn follow(&self, mut adapter: Box<dyn compositor::Adapter>, session: &Session, bus: &zbus::blocking::Connection) {
+        let name = session.compositor().to_owned();
+        loop {
+            let state = adapter.state();
+            self.publish(bus, |s| *s = CompositorState { name: name.clone(), ready: true, state });
+            let Some(ready) = self.wait_while(session, &adapter.fds()) else { return };
+            for index in ready {
+                if let Err(error) = adapter.read(index) {
+                    eprintln!("serpantinum-core: lost {name}: {error}");
+                    return;
+                }
+            }
+        }
+    }
+}
+
 pub struct Core;
 
 #[interface(name = "org.serpantinum.Core")]
@@ -315,6 +434,54 @@ impl LockState {
     #[zbus(property)]
     fn num_lock(&self) -> bool {
         self.0.state.lock().unwrap().num
+    }
+}
+
+pub struct Compositor(pub Arc<CompositorFeed>);
+
+#[interface(name = "org.serpantinum.Core.Compositor")]
+impl Compositor {
+    /// Follows the compositor that `session` names until this client unsubscribes. The variables
+    /// are those of `compositor::SESSION_VARS`; the latest subscriber's session is followed.
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>, session: HashMap<String, String>) -> fdo::Result<()> {
+        *self.0.session.lock().unwrap() = Session::new(session);
+        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
+        self.0.waker.wake();
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    #[zbus(property)]
+    fn name(&self) -> String {
+        self.0.state.lock().unwrap().name.clone()
+    }
+
+    /// False while not connected, when the other properties may be stale
+    #[zbus(property)]
+    fn ready(&self) -> bool {
+        self.0.state.lock().unwrap().ready
+    }
+
+    /// JSON: the active workspace, the active one per output and the occupied ones
+    #[zbus(property)]
+    fn workspaces(&self) -> String {
+        self.0.state.lock().unwrap().state.workspaces.to_string()
+    }
+
+    /// JSON: the windows, in the shape the compositor's singleton in the shell keeps
+    #[zbus(property)]
+    fn windows(&self) -> String {
+        self.0.state.lock().unwrap().state.windows.to_string()
+    }
+
+    /// JSON: the keyboard layouts and the active one
+    #[zbus(property)]
+    fn keyboard(&self) -> String {
+        self.0.state.lock().unwrap().state.keyboard.to_string()
     }
 }
 
