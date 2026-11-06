@@ -27,6 +27,12 @@ Feeds cost nothing while nobody watches them: the daemon samples only while a cl
 and the lease ends when that client exits. When several clients watch the same feed, it samples at
 the shortest interval any of them asked for.
 
+Caps Lock and Num Lock follow the keyboards' LED events when `/dev/input` can be read, as for
+members of the `input` group, and nothing runs between changes. Otherwise the LEDs in
+`/sys/class/leds` are polled every 250 ms while someone watches, since the kernel signals no changes
+there. On Hyprland every change is checked against Hyprland's main keyboard, which ignores LED
+flicker from other keyboards.
+
 The clipboard commands read the history from [cliphist](https://github.com/sentriz/cliphist), which
 must be installed. Decoded images and pins are kept in `--cache-dir`, by default
 `$XDG_CACHE_HOME/serpantinum/clipboard`.

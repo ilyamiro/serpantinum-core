@@ -25,6 +25,10 @@ pub const CLIPBOARD_PATH: &str = "/clipboard";
 pub const CLIPBOARD_INTERFACE: &str = "org.serpantinum.Core.Clipboard";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const MIN_INTERVAL: Duration = Duration::from_millis(100);
+const PRIMING: Duration = Duration::from_millis(250);
+const DEVICE_SETTLE: Duration = Duration::from_millis(500);
+/// How often the polled LEDs are looked up again, in case a keyboard came without a device event
+const LED_RESCAN: Duration = Duration::from_secs(30);
 
 type Properties = Vec<(&'static str, Value<'static>)>;
 
@@ -90,10 +94,14 @@ impl SysFeed {
         let mut last: Option<Instant> = None;
         loop {
             let every = self.leases.wait_interval();
-            let now = Instant::now();
-            if last.is_none_or(|at| now.duration_since(at) > every * 3) {
+            // CPU and network usage are differences between two samples, so after a pause a short
+            // first measurement replaces the stale one
+            if last.is_none_or(|at| at.elapsed() > every * 3) {
                 sampler.reset_network();
+                sampler.sample(Instant::now());
+                std::thread::sleep(PRIMING);
             }
+            let now = Instant::now();
             last = Some(now);
             let usage = sampler.sample(now);
             let changes = {
@@ -120,22 +128,77 @@ fn lock_properties(locks: Locks) -> Properties {
 
 impl LockFeed {
     pub fn new() -> Arc<LockFeed> {
-        Arc::new(LockFeed { leases: Leases::default(), state: Mutex::new(locks::read(Path::new(locks::LEDS))) })
+        let state = locks::hyprland().unwrap_or_else(|| locks::read_leds(Path::new(locks::LEDS)));
+        Arc::new(LockFeed { leases: Leases::default(), state: Mutex::new(state) })
     }
 
+    /// Follows the keyboards' events when they can be opened, else polls the LEDs, and looks again
+    /// whenever an input device is added or removed
     pub fn run(&self, bus: &zbus::blocking::Connection) {
+        let watch = locks::DeviceWatch::new();
+        loop {
+            let keyboards = locks::open_keyboards();
+            if keyboards.is_empty() {
+                self.poll_leds(watch.as_ref(), bus);
+            } else {
+                self.follow(keyboards, watch.as_ref(), bus);
+            }
+            // udev names and permits a new device shortly after it appears
+            std::thread::sleep(DEVICE_SETTLE);
+        }
+    }
+
+    fn follow(
+        &self,
+        mut keyboards: Vec<std::fs::File>,
+        watch: Option<&locks::DeviceWatch>,
+        bus: &zbus::blocking::Connection,
+    ) {
+        use std::os::fd::AsRawFd;
+        while !keyboards.is_empty() {
+            let mut fds: Vec<i32> = keyboards.iter().map(|k| k.as_raw_fd()).collect();
+            fds.extend(watch.map(|w| w.fd()));
+            let Some(revents) = locks::wait_readable(&fds) else { return };
+            if watch.is_some_and(|w| revents[keyboards.len()] != 0 && w.drain()) {
+                return;
+            }
+            let mut seen = *self.state.lock().unwrap();
+            let mut index = 0;
+            keyboards.retain(|keyboard| {
+                let ready = revents[index] != 0;
+                index += 1;
+                !ready || locks::read_keyboard(keyboard, &mut seen).is_some()
+            });
+            self.update(seen, bus);
+        }
+    }
+
+    fn poll_leds(&self, watch: Option<&locks::DeviceWatch>, bus: &zbus::blocking::Connection) {
+        let leds = locks::LedFiles::open(Path::new(locks::LEDS));
+        let opened = Instant::now();
         loop {
             let every = self.leases.wait_interval();
-            let now = locks::read(Path::new(locks::LEDS));
-            let changes = {
-                let mut state = self.state.lock().unwrap();
-                let before = lock_properties(*state);
-                *state = now;
-                changed(before, lock_properties(now))
-            };
-            emit(bus, LOCKS_PATH, LOCKS_INTERFACE, changes);
+            self.update(leds.read(), bus);
+            if watch.is_some_and(|w| w.drain()) || opened.elapsed() >= LED_RESCAN {
+                return;
+            }
             self.leases.sleep(every);
         }
+    }
+
+    /// Takes a change the keyboards report, confirmed by Hyprland when running under it
+    fn update(&self, seen: Locks, bus: &zbus::blocking::Connection) {
+        if seen == *self.state.lock().unwrap() {
+            return;
+        }
+        let now = locks::hyprland().unwrap_or(seen);
+        let changes = {
+            let mut state = self.state.lock().unwrap();
+            let before = lock_properties(*state);
+            *state = now;
+            changed(before, lock_properties(now))
+        };
+        emit(bus, LOCKS_PATH, LOCKS_INTERFACE, changes);
     }
 }
 

@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -55,6 +56,26 @@ fn is_image(path: &Path) -> bool {
         && path.is_file()
 }
 
+/// `~/x` in `home` and `~user/x` in that user's home, as a shell expands them
+fn expand_tilde(text: &str, home: &Path) -> Option<PathBuf> {
+    let rest = text.strip_prefix('~')?;
+    let (user, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let base = if user.is_empty() {
+        home.to_path_buf()
+    } else {
+        let name = std::ffi::CString::new(user).ok()?;
+        // SAFETY: name is a valid C string; the entry is read before any other passwd call
+        let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+        if entry.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null entry has a valid pw_dir string
+        let dir = unsafe { std::ffi::CStr::from_ptr((*entry).pw_dir) };
+        PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()))
+    };
+    Some(if path.is_empty() { base } else { base.join(path) })
+}
+
 /// The first existing image file the text names, as a path, `~/` path or `file://` URL
 pub fn image_path(text: &str, home: &Path) -> Option<PathBuf> {
     let text = text.trim();
@@ -62,8 +83,8 @@ pub fn image_path(text: &str, home: &Path) -> Option<PathBuf> {
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Some(path) = file_url_path(line) {
             candidates.push(path.into());
-        } else if let Some(rest) = line.strip_prefix("~/") {
-            candidates.push(home.join(rest));
+        } else if line.starts_with('~') {
+            candidates.extend(expand_tilde(line, home));
         } else if line.starts_with('/') {
             candidates.push(line.into());
         }
@@ -221,6 +242,9 @@ mod tests {
         assert_eq!(image_path(&url, Path::new("/")), Some(image.clone()));
         assert_eq!(image_path(&format!("  {}\n", image.display()), Path::new("/")), Some(image.clone()));
         assert_eq!(image_path("~/shot one.PNG", dir.path()), Some(image));
+        assert_eq!(expand_tilde("~", dir.path()), Some(dir.path().to_path_buf()));
+        assert_eq!(expand_tilde("~root/x.png", dir.path()), Some(PathBuf::from("/root/x.png")));
+        assert_eq!(expand_tilde("~no-such-user-here/x.png", dir.path()), None);
         assert_eq!(image_path(&dir.path().join("notes.txt").to_string_lossy(), Path::new("/")), None);
         assert_eq!(image_path("hello world", Path::new("/")), None);
     }

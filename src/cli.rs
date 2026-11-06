@@ -154,7 +154,7 @@ fn start(conn: &Connection) -> Result<()> {
     }
     let exe = std::env::current_exe().map_err(|e| failed(format!("cannot find this program: {e}")))?;
     let mut daemon = Command::new(exe);
-    daemon.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit());
+    daemon.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // SAFETY: setsid is async-signal-safe, so it may run between fork and exec. A session of its own
     // keeps the daemon alive when the caller's process group goes away.
     unsafe {
@@ -238,13 +238,13 @@ fn properties<'a>(conn: &Connection, path: &'a str) -> Result<PropertiesProxy<'a
         .build()?)
 }
 
-/// The properties, and whether they hold a sample yet: a feed that was never sampled shows zeros
+/// The properties, and whether they are current: a sampled feed holds the last sample taken, maybe
+/// long ago, until the fresh one a subscription brings
 fn snapshot(props: &PropertiesProxy, interface: &str) -> Result<(Map<String, Json>, bool)> {
     let all = props.get_all(InterfaceName::try_from(interface)?)?;
     let mut state = Map::new();
     merge(&mut state, all.iter().map(|(name, value)| (name.as_str(), &**value)));
-    let sampled = all.get("Samples").is_none_or(|samples| **samples != Value::U64(0));
-    Ok((state, sampled))
+    Ok((state, !all.contains_key("Samples")))
 }
 
 fn subscribe(conn: &Connection, path: &str, interface: &str, every: Duration) -> Result<()> {
@@ -289,9 +289,9 @@ fn watch(path: &'static str, interface: &'static str, every: Duration) -> Result
             let props = properties(&conn, path)?;
             subscribe(&conn, path, interface, every)?;
             let mut state = state.lock().unwrap();
-            let sampled;
-            (*state, sampled) = snapshot(&props, interface)?;
-            if sampled {
+            let current;
+            (*state, current) = snapshot(&props, interface)?;
+            if current {
                 print(&Json::Object(state.clone()).to_string());
             }
             Ok(())
