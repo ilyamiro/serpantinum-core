@@ -159,6 +159,12 @@ impl Model {
         })
     }
 
+    pub fn focus(&self) -> Option<(String, String)> {
+        let w = self.windows.values().find(|w| is_true(w, "is_focused"))?;
+        let text = |key: &str| w.get(key).and_then(Json::as_str).unwrap_or_default().to_owned();
+        Some((text("app_id"), text("title")))
+    }
+
     pub fn state(&self) -> State {
         State {
             workspaces: self.workspaces_json(),
@@ -206,6 +212,10 @@ impl Adapter for Niri {
             }
         }
         Ok(())
+    }
+
+    fn focus(&self) -> Option<(String, String)> {
+        self.model.focus()
     }
 
     fn state(&self) -> State {

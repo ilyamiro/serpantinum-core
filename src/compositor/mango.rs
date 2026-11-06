@@ -105,6 +105,13 @@ impl Adapter for Mango {
         Ok(())
     }
 
+    fn focus(&self) -> Option<(String, String)> {
+        let clients = self.state.windows.as_array()?;
+        let c = clients.iter().find(|c| c["is_focused"] == true && !c["id"].is_null())?;
+        let text = |key: &str| c[key].as_str().unwrap_or_default().to_owned();
+        Some((text("appid"), text("title")))
+    }
+
     fn state(&self) -> State {
         self.state.clone()
     }

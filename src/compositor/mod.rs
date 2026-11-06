@@ -1,10 +1,11 @@
 //! Workspaces, windows and the keyboard layout of the running compositor, followed over its own
-//! socket while someone watches. Sway, Niri and Mango are served; Hyprland is left to the shell,
-//! which reads it natively.
+//! socket while someone watches. Sway, Niri and Mango are served; of Hyprland, which the shell reads
+//! natively, only the focused window is followed, for screen time.
 //!
 //! The daemon may outlive a login, so it does not trust its own environment: every watcher passes
 //! the variables that locate its compositor, and the latest one wins.
 
+mod hyprland;
 mod mango;
 mod niri;
 mod sway;
@@ -102,6 +103,8 @@ pub trait Adapter: Send {
     /// Takes what the descriptor at `index` has to say. An error ends the connection.
     fn read(&mut self, index: usize) -> io::Result<()>;
     fn state(&self) -> State;
+    /// The class and title of the focused window, `None` when no window has focus
+    fn focus(&self) -> Option<(String, String)>;
 }
 
 /// Connects to the compositor of `session`. `None` when it is not one that is served here.
@@ -110,6 +113,7 @@ pub fn connect(session: &Session) -> Option<io::Result<Box<dyn Adapter>>> {
         "sway" => Sway::connect(session).map(|a| Box::new(a) as Box<dyn Adapter>),
         "niri" => niri::Niri::connect(session).map(|a| Box::new(a) as Box<dyn Adapter>),
         "mango" => mango::Mango::connect(session).map(|a| Box::new(a) as Box<dyn Adapter>),
+        "hyprland" => hyprland::Hyprland::connect(session).map(|a| Box::new(a) as Box<dyn Adapter>),
         _ => return None,
     };
     Some(adapter)

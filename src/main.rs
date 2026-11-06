@@ -6,6 +6,7 @@ mod dbus;
 mod idle;
 mod leases;
 mod locks;
+mod screentime;
 mod sysinfo;
 
 use std::path::PathBuf;
@@ -16,8 +17,8 @@ use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
 use crate::dbus::{
     BRIGHTNESS_PATH, BUS_NAME, BrightnessControl, BrightnessFeed, CLIPBOARD_PATH, COMPOSITOR_PATH, Clipboard,
-    Compositor, CompositorFeed, Core, IDLE_PATH, Idle, IdleFeed, LOCKS_PATH, LockFeed, LockState, SYSINFO_PATH,
-    ScreenSaver, SysFeed, SysInfo,
+    Compositor, CompositorFeed, Core, IDLE_PATH, Idle, IdleFeed, LOCKS_PATH, LockFeed, LockState, SCREENTIME_PATH,
+    SYSINFO_PATH, ScreenSaver, ScreenTime, ScreenTimeFeed, SysFeed, SysInfo,
 };
 
 enum Outcome {
@@ -57,6 +58,7 @@ fn run() -> Result<Outcome, String> {
     let compositor = CompositorFeed::new();
     let brightness = BrightnessFeed::new();
     let idle = IdleFeed::new();
+    let screentime = ScreenTimeFeed::new(compositor.clone());
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
 
     let server = bus.object_server();
@@ -69,6 +71,7 @@ fn run() -> Result<Outcome, String> {
     for path in idle::SCREENSAVER_PATHS {
         server.at(path, ScreenSaver(idle.clone())).map_err(|e| e.to_string())?;
     }
+    server.at(SCREENTIME_PATH, ScreenTime(screentime.clone())).map_err(|e| e.to_string())?;
     server.at(COMPOSITOR_PATH, Compositor(compositor.clone())).map_err(|e| e.to_string())?;
 
     // Listen before taking the name, so no client can subscribe and leave unnoticed
@@ -106,6 +109,11 @@ fn run() -> Result<Outcome, String> {
         std::thread::spawn(move || feed.run(&bus));
     }
 
+    {
+        let feed = screentime.clone();
+        std::thread::spawn(move || feed.run());
+    }
+
     for signal in departures {
         let Ok(args) = signal.args() else { continue };
         if args.new_owner().is_none() {
@@ -114,6 +122,7 @@ fn run() -> Result<Outcome, String> {
             compositor.remove(args.name());
             brightness.remove(args.name());
             idle.remove(args.name());
+            screentime.leases.remove(args.name());
         }
     }
     Err("lost the session bus".to_owned())

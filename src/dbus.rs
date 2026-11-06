@@ -18,6 +18,7 @@ use crate::compositor::{self, Session, Waker};
 use crate::idle::{self, Event, Inhibition, SleepLock};
 use crate::leases::Leases;
 use crate::locks::{self, Locks};
+use crate::screentime::{self, Notified, Tracker};
 use crate::sysinfo::{Sampler, Usage};
 
 pub const BUS_NAME: &str = "org.serpantinum.Core";
@@ -32,6 +33,8 @@ pub const BRIGHTNESS_PATH: &str = "/brightness";
 pub const BRIGHTNESS_INTERFACE: &str = "org.serpantinum.Core.Brightness";
 pub const IDLE_PATH: &str = "/idle";
 pub const IDLE_INTERFACE: &str = "org.serpantinum.Core.Idle";
+pub const SCREENTIME_PATH: &str = "/screentime";
+pub const SCREENTIME_INTERFACE: &str = "org.serpantinum.Core.ScreenTime";
 pub const COMPOSITOR_PATH: &str = "/compositor";
 pub const COMPOSITOR_INTERFACE: &str = "org.serpantinum.Core.Compositor";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
@@ -220,6 +223,7 @@ struct CompositorState {
     name: String,
     ready: bool,
     state: compositor::State,
+    focus: Option<(String, String)>,
 }
 
 impl CompositorState {
@@ -255,6 +259,19 @@ impl CompositorFeed {
     pub fn remove(&self, owner: &str) {
         self.leases.remove(owner);
         self.waker.wake();
+    }
+
+    /// Follows the session's compositor for a client inside the daemon
+    pub fn add(&self, owner: &str, session: Session) {
+        *self.session.lock().unwrap() = session;
+        self.leases.add(owner, MIN_INTERVAL);
+        self.waker.wake();
+    }
+
+    /// The focused window's class and title; `None` while not connected, `Some(None)` on the desktop
+    pub fn focus(&self) -> Option<Option<(String, String)>> {
+        let state = self.state.lock().unwrap();
+        state.ready.then(|| state.focus.clone())
     }
 
     fn publish(&self, bus: &zbus::blocking::Connection, update: impl FnOnce(&mut CompositorState)) {
@@ -316,8 +333,8 @@ impl CompositorFeed {
     fn follow(&self, mut adapter: Box<dyn compositor::Adapter>, session: &Session, bus: &zbus::blocking::Connection) {
         let name = session.compositor().to_owned();
         loop {
-            let state = adapter.state();
-            self.publish(bus, |s| *s = CompositorState { name: name.clone(), ready: true, state });
+            let (state, focus) = (adapter.state(), adapter.focus());
+            self.publish(bus, |s| *s = CompositorState { name: name.clone(), ready: true, state, focus });
             let Some(ready) = self.wait_while(session, &adapter.fds()) else { return };
             for index in ready {
                 if let Err(error) = adapter.read(index) {
@@ -596,6 +613,212 @@ impl IdleFeed {
     }
 }
 
+/// The variables screen time reads, besides those that locate the compositor
+pub const SCREENTIME_VARS: &[&str] = &[
+    "QS_RUN_FOCUSTIME",
+    "QS_STATE_FOCUSTIME",
+    "QS_SETTINGS",
+    "QS_RUN_LOCK",
+    "QS_RUN_DIR",
+    "SERPANTINUM_DIR",
+    "HOME",
+    "LC_ALL",
+    "LC_MESSAGES",
+    "LANG",
+];
+const SCREENTIME_LEASE: &str = "screentime";
+const SCREENTIME_RETRY: Duration = Duration::from_secs(10);
+
+/// Where screen time keeps its files, from the tracking client's environment
+struct ScreenTimePaths {
+    run: PathBuf,
+    db: PathBuf,
+    home: PathBuf,
+    settings: PathBuf,
+    languages: PathBuf,
+    lock_marker: PathBuf,
+}
+
+impl ScreenTimePaths {
+    fn new(env: &HashMap<String, String>) -> ScreenTimePaths {
+        let var = |name: &str| env.get(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let home = var("HOME").unwrap_or_default();
+        let runtime = var("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into());
+        ScreenTimePaths {
+            run: var("QS_RUN_FOCUSTIME").unwrap_or_else(|| "/tmp/quickshell/focustime".into()),
+            db: var("QS_STATE_FOCUSTIME").unwrap_or_else(|| home.join(".local/state/quickshell/focustime")),
+            settings: var("QS_SETTINGS").unwrap_or_else(|| home.join(".config/serpantinum/settings.json")),
+            languages: var("SERPANTINUM_DIR").map(|d| d.join("assets/languages")).unwrap_or_default(),
+            lock_marker: var("QS_RUN_LOCK")
+                .unwrap_or_else(|| var("QS_RUN_DIR").unwrap_or_else(|| runtime.join("serpantinum")).join("lock"))
+                .join("locked"),
+            home,
+        }
+    }
+}
+
+/// The settings file, read again when it changes
+#[derive(Default)]
+struct Settings {
+    modified: Option<std::time::SystemTime>,
+    data: serde_json::Value,
+}
+
+impl Settings {
+    fn refresh(&mut self, path: &Path) {
+        let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else { return };
+        if self.modified == Some(modified) {
+            return;
+        }
+        self.modified = Some(modified);
+        if let Some(data) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()) {
+            self.data = data;
+        }
+    }
+}
+
+pub struct ScreenTimeFeed {
+    pub leases: Leases,
+    env: Mutex<HashMap<String, String>>,
+    compositor: Arc<CompositorFeed>,
+}
+
+impl ScreenTimeFeed {
+    pub fn new(compositor: Arc<CompositorFeed>) -> Arc<ScreenTimeFeed> {
+        Arc::new(ScreenTimeFeed { leases: Leases::default(), env: Mutex::default(), compositor })
+    }
+
+    /// Counts focus time once a second while anyone tracks, as the shell's focus daemon did
+    pub fn run(&self) {
+        loop {
+            self.leases.wait_interval();
+            let env = self.env.lock().unwrap().clone();
+            let paths = ScreenTimePaths::new(&env);
+            let _ = std::fs::create_dir_all(&paths.run);
+            let _ = std::fs::create_dir_all(&paths.db);
+            screentime::migrate(&paths.db, &paths.home);
+            let conn = match screentime::open(&paths.db.join("focustime.db")) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    eprintln!("serpantinum-core: cannot open the screen time database: {error}");
+                    self.leases.sleep(SCREENTIME_RETRY);
+                    continue;
+                }
+            };
+            self.compositor.add(SCREENTIME_LEASE, Session::new(env.clone()));
+            let tracker = Tracker::new(conn, paths.run.join("focustime_state.json"));
+            self.track(tracker, &paths, &env);
+            self.compositor.remove(SCREENTIME_LEASE);
+        }
+    }
+
+    fn focused(&self, paths: &ScreenTimePaths) -> (String, String) {
+        let locked = || ("Locked".to_owned(), "Locked".to_owned());
+        if paths.lock_marker.exists() {
+            return locked();
+        }
+        match self.compositor.focus() {
+            Some(Some((class, title))) => {
+                let (class, title) = screentime::classify_window(&class, &title);
+                if class == "hyprlock" { locked() } else { (class, title) }
+            }
+            _ => ("Desktop".to_owned(), "Desktop".to_owned()),
+        }
+    }
+
+    fn track(&self, mut tracker: Tracker, paths: &ScreenTimePaths, env: &HashMap<String, String>) {
+        let mut settings = Settings::default();
+        let mut today = screentime::now().date;
+        let notified_path = paths.db.join("limit_notified.json");
+        let mut notified = Notified::load(&notified_path, today);
+        let mut last = Instant::now();
+        let mut accumulated = 0.0;
+        let mut ticks: u64 = 0;
+        while self.leases.active() {
+            self.leases.sleep(Duration::from_secs(1));
+            if !self.leases.active() {
+                break;
+            }
+            let now = Instant::now();
+            let delta = now.duration_since(last).as_secs_f64();
+            last = now;
+            accumulated += if delta > 3.0 { 1.0 } else { delta };
+            let seconds = accumulated.floor();
+            if seconds < 1.0 {
+                continue;
+            }
+            accumulated -= seconds;
+            ticks += 1;
+            let write = ticks.is_multiple_of(5);
+
+            let date = screentime::now().date;
+            if date != today {
+                today = date;
+                notified = Notified::default();
+                notified.save(&notified_path, today);
+            }
+            if ticks % 5 == 1 {
+                settings.refresh(&paths.settings);
+            }
+            let wellbeing = &settings.data["wellbeing"];
+            let lower = |v: &serde_json::Value| v.as_str().map_or_else(|| v.to_string(), str::to_owned).to_lowercase();
+            let excluded: Vec<String> = wellbeing["excludedApps"].as_array().into_iter().flatten().map(lower).collect();
+            let overall_limit = wellbeing["overallDailyLimit"].as_f64().unwrap_or(0.0);
+            let app_limits: HashMap<String, f64> = wellbeing["appLimits"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| (k.to_lowercase(), v.as_f64().unwrap_or(0.0)))
+                .collect();
+
+            let (class, title) = self.focused(paths);
+            let counted =
+                !screentime::SYSTEM_STATES.contains(&class.as_str()) && !excluded.contains(&class.to_lowercase());
+            if !counted {
+                tracker.tick(&class, &title, 0, write);
+                continue;
+            }
+            tracker.tick(&class, &title, seconds as i64, write);
+            let Some(cached) = tracker.cached() else { continue };
+            let lang = screentime::language(&settings.data, env);
+            let text = |key: &str, default: &str, vars: &[(&str, &str)]| {
+                screentime::translate(&paths.languages, &lang, key, default, vars)
+            };
+            let heading = text("guide.wellbeing.notify.title", "Digital wellbeing", &[]);
+            let total = cached["total"].as_i64().unwrap_or(0);
+            if overall_limit > 0.0 && total as f64 >= overall_limit && !notified.overall {
+                let body = text("guide.wellbeing.notify.overall_reached", "Your overall daily limit is reached", &[]);
+                screentime::notify(&heading, &body);
+                notified.overall = true;
+                notified.save(&notified_path, today);
+            }
+            let app = cached["apps"].as_array().into_iter().flatten().find(|a| a["class"] == class.as_str());
+            let app_seconds = app.and_then(|a| a["seconds"].as_i64()).unwrap_or(0);
+            let app_name = app.and_then(|a| a["name"].as_str()).filter(|n| !n.is_empty()).unwrap_or(&title).to_owned();
+            let key = class.to_lowercase();
+            let limit = app_limits.get(&key).copied().unwrap_or(0.0);
+            if limit > 0.0 && app_seconds as f64 >= limit && !notified.apps.contains(&key) {
+                let body = text(
+                    "guide.wellbeing.notify.app_reached",
+                    "Your daily limit for {app} is reached",
+                    &[("app", app_name.as_str())],
+                );
+                screentime::notify(&heading, &body);
+                screentime::emit_limit_event(
+                    &paths.run.join("limit_event.json"),
+                    &class,
+                    &app_name,
+                    app_seconds,
+                    limit as i64,
+                );
+                notified.apps.insert(key);
+                notified.save(&notified_path, today);
+            }
+        }
+        tracker.flush();
+    }
+}
+
 pub struct Core;
 
 #[interface(name = "org.serpantinum.Core")]
@@ -843,6 +1066,24 @@ impl ScreenSaver {
     }
 }
 
+pub struct ScreenTime(pub Arc<ScreenTimeFeed>);
+
+#[interface(name = "org.serpantinum.Core.ScreenTime")]
+impl ScreenTime {
+    /// Counts focus time until this client unsubscribes. `env` holds the variables of
+    /// `SCREENTIME_VARS` and `compositor::SESSION_VARS`; the latest subscriber's are used.
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>, env: HashMap<String, String>) -> fdo::Result<()> {
+        *self.0.env.lock().unwrap() = env;
+        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.leases.remove(&owner(&header)?);
+        Ok(())
+    }
+}
+
 pub struct Compositor(pub Arc<CompositorFeed>);
 
 #[interface(name = "org.serpantinum.Core.Compositor")]
@@ -850,9 +1091,7 @@ impl Compositor {
     /// Follows the compositor that `session` names until this client unsubscribes. The variables
     /// are those of `compositor::SESSION_VARS`; the latest subscriber's session is followed.
     fn subscribe(&self, #[zbus(header)] header: Header<'_>, session: HashMap<String, String>) -> fdo::Result<()> {
-        *self.0.session.lock().unwrap() = Session::new(session);
-        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
-        self.0.waker.wake();
+        self.0.add(&owner(&header)?, Session::new(session));
         Ok(())
     }
 

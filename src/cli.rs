@@ -19,12 +19,13 @@ use zbus::names::{BusName, InterfaceName};
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::Value;
 
-use crate::compositor::Session;
+use crate::compositor::{SESSION_VARS, Session};
 use crate::dbus::{
     BRIGHTNESS_INTERFACE, BRIGHTNESS_PATH, BUS_NAME, CLIPBOARD_INTERFACE, CLIPBOARD_PATH, COMPOSITOR_INTERFACE,
-    COMPOSITOR_PATH, CORE_INTERFACE, IDLE_INTERFACE, IDLE_PATH, LOCKS_INTERFACE, LOCKS_PATH, SYSINFO_INTERFACE,
-    SYSINFO_PATH,
+    COMPOSITOR_PATH, CORE_INTERFACE, IDLE_INTERFACE, IDLE_PATH, LOCKS_INTERFACE, LOCKS_PATH, SCREENTIME_INTERFACE,
+    SCREENTIME_PATH, SCREENTIME_VARS, SYSINFO_INTERFACE, SYSINFO_PATH,
 };
+use crate::screentime;
 
 pub const USAGE: &str = "\
 Usage: serpantinum-core [COMMAND]
@@ -50,6 +51,9 @@ Commands:
   brightness set PERCENT        Set the brightness
   brightness raise|lower        Raise or lower the brightness by 5 percent
   brightness backend            Print backlight, ddc or none
+  screentime track              Count the focused app's screen time while running
+  screentime stats [DATE]       Print the screen time statistics of DATE (YYYY-MM-DD, default today);
+                                --app CLASS for one app, --db-dir DIR for another database
   clipboard list OFFSET LIMIT   Print a page of the clipboard history
   clipboard pin ID              Pin or unpin an entry
   clipboard delete ID           Delete an entry
@@ -144,7 +148,7 @@ fn options(args: &[String]) -> Result<(Vec<&str>, HashMap<&str, &str>)> {
 
 fn command(args: &[String]) -> Result<()> {
     let (positional, options) = options(args)?;
-    if let Some(name) = options.keys().find(|n| !matches!(**n, "interval" | "cache-dir")) {
+    if let Some(name) = options.keys().find(|n| !matches!(**n, "interval" | "cache-dir" | "app" | "db-dir")) {
         return Err(usage(format!("unknown option --{name}")));
     }
     match positional.as_slice() {
@@ -164,6 +168,10 @@ fn command(args: &[String]) -> Result<()> {
         ["watch", "brightness"] => watch(BRIGHTNESS_PATH, BRIGHTNESS_INTERFACE, Lease::Plain),
         ["brightness", rest @ ..] => brightness(rest),
         ["watch", "idle", marker] => watch_idle(marker),
+        ["screentime", "track"] => track_screentime(),
+        ["screentime", "stats", rest @ ..] if rest.len() <= 1 => {
+            screentime_stats(rest.first().copied(), options.get("app").copied(), options.get("db-dir").copied())
+        }
         ["clipboard", rest @ ..] => clipboard(rest, options.get("cache-dir").copied()),
         [] => Err(usage("no command")),
         _ => Err(usage(format!("unknown command: {}", positional.join(" ")))),
@@ -473,6 +481,64 @@ fn watch_idle(marker: &str) -> Result<()> {
         }
     }
     Err(failed("lost the session bus"))
+}
+
+/// Holds the screen time lease for as long as this runs, taken again when the daemon restarts
+fn track_screentime() -> Result<()> {
+    let conn = connect()?;
+    start(&conn)?;
+    let owners = DBusProxy::new(&conn)?.receive_name_owner_changed_with_args(&[(0, BUS_NAME)])?;
+    let env: HashMap<String, String> = SCREENTIME_VARS
+        .iter()
+        .chain(SESSION_VARS)
+        .filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?)))
+        .collect();
+    let subscribe = || -> Result<()> {
+        Proxy::new(&conn, BUS_NAME, SCREENTIME_PATH, SCREENTIME_INTERFACE)?.call_method("Subscribe", &(&env,))?;
+        Ok(())
+    };
+    subscribe()?;
+    for signal in owners {
+        let Ok(args) = signal.args() else { continue };
+        let outcome = if args.new_owner().is_some() {
+            subscribe()
+        } else {
+            sleep(RESTART_DELAY);
+            start(&conn)
+        };
+        if let Err(Error::Failed(message) | Error::Usage(message)) = outcome {
+            eprintln!("serpantinum-core: {message}");
+        }
+    }
+    Err(failed("lost the session bus"))
+}
+
+/// The statistics of a day straight from the database, as the wellbeing page asks for them
+fn screentime_stats(date: Option<&str>, app: Option<&str>, db_dir: Option<&str>) -> Result<()> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let dir = db_dir
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("QS_STATE_FOCUSTIME").map(PathBuf::from))
+        .unwrap_or_else(|| home.join(".local/state/quickshell/focustime"));
+    screentime::migrate(&dir, &home);
+    let db = dir.join("focustime.db");
+    if !db.exists() {
+        print(
+            &serde_json::json!({
+                "total": 0, "average": 0, "week_range": "", "yesterday": 0, "current": "History",
+                "apps": [], "week_apps": [], "week": [], "month": [], "hourly": vec![0; 48],
+                "week_heatmap": vec![[0; 24]; 7], "peak_usage_str": "N/A", "all_known_apps": [],
+            })
+            .to_string(),
+        );
+        return Ok(());
+    }
+    let conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| failed(format!("cannot open {}: {e}", db.display())))?;
+    let target = screentime::target_date(date);
+    let label = date.map_or_else(|| target.iso(), str::to_owned);
+    print(&screentime::stats(&conn, target, &label, app, app.unwrap_or("History")).to_string());
+    Ok(())
 }
 
 fn brightness(args: &[&str]) -> Result<()> {

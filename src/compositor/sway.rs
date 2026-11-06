@@ -280,6 +280,11 @@ impl Adapter for Sway {
         self.fetch(want)
     }
 
+    fn focus(&self) -> Option<(String, String)> {
+        let w = self.windows.iter().find(|w| w["focused"] == true)?;
+        Some((w["appId"].as_str()?.to_owned(), w["title"].as_str().unwrap_or_default().to_owned()))
+    }
+
     fn state(&self) -> State {
         State {
             workspaces: json!({

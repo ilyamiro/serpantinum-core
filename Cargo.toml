@@ -9,6 +9,7 @@ repository = "https://github.com/ilyamiro/serpantinum-core"
 [dependencies]
 blocking = "1"
 libc = "0.2"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 rustix = { version = "1", features = ["fs"] }
 serde_json = "1"
 zbus = "5"
