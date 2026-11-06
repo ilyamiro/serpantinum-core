@@ -1,3 +1,4 @@
+mod brightness;
 mod cli;
 mod clipboard;
 mod compositor;
@@ -13,8 +14,8 @@ use zbus::blocking::fdo::DBusProxy;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
 use crate::dbus::{
-    BUS_NAME, CLIPBOARD_PATH, COMPOSITOR_PATH, Clipboard, Compositor, CompositorFeed, Core, LOCKS_PATH, LockFeed,
-    LockState, SYSINFO_PATH, SysFeed, SysInfo,
+    BRIGHTNESS_PATH, BUS_NAME, BrightnessControl, BrightnessFeed, CLIPBOARD_PATH, COMPOSITOR_PATH, Clipboard,
+    Compositor, CompositorFeed, Core, LOCKS_PATH, LockFeed, LockState, SYSINFO_PATH, SysFeed, SysInfo,
 };
 
 enum Outcome {
@@ -52,6 +53,7 @@ fn run() -> Result<Outcome, String> {
     let sysinfo = SysFeed::new();
     let locks = LockFeed::new();
     let compositor = CompositorFeed::new();
+    let brightness = BrightnessFeed::new();
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
 
     let server = bus.object_server();
@@ -59,6 +61,7 @@ fn run() -> Result<Outcome, String> {
     server.at(SYSINFO_PATH, SysInfo(sysinfo.clone())).map_err(|e| e.to_string())?;
     server.at(LOCKS_PATH, LockState(locks.clone())).map_err(|e| e.to_string())?;
     server.at(CLIPBOARD_PATH, Clipboard { home }).map_err(|e| e.to_string())?;
+    server.at(BRIGHTNESS_PATH, BrightnessControl(brightness.clone())).map_err(|e| e.to_string())?;
     server.at(COMPOSITOR_PATH, Compositor(compositor.clone())).map_err(|e| e.to_string())?;
 
     // Listen before taking the name, so no client can subscribe and leave unnoticed
@@ -86,12 +89,18 @@ fn run() -> Result<Outcome, String> {
         std::thread::spawn(move || feed.run(&bus));
     }
 
+    {
+        let (feed, bus) = (brightness.clone(), bus.clone());
+        std::thread::spawn(move || feed.run(&bus));
+    }
+
     for signal in departures {
         let Ok(args) = signal.args() else { continue };
         if args.new_owner().is_none() {
             sysinfo.leases.remove(args.name());
             locks.leases.remove(args.name());
             compositor.remove(args.name());
+            brightness.remove(args.name());
         }
     }
     Err("lost the session bus".to_owned())

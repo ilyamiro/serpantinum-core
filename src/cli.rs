@@ -21,8 +21,8 @@ use zbus::zvariant::Value;
 
 use crate::compositor::Session;
 use crate::dbus::{
-    BUS_NAME, CLIPBOARD_INTERFACE, CLIPBOARD_PATH, COMPOSITOR_INTERFACE, COMPOSITOR_PATH, CORE_INTERFACE,
-    LOCKS_INTERFACE, LOCKS_PATH, SYSINFO_INTERFACE, SYSINFO_PATH,
+    BRIGHTNESS_INTERFACE, BRIGHTNESS_PATH, BUS_NAME, CLIPBOARD_INTERFACE, CLIPBOARD_PATH, COMPOSITOR_INTERFACE,
+    COMPOSITOR_PATH, CORE_INTERFACE, LOCKS_INTERFACE, LOCKS_PATH, SYSINFO_INTERFACE, SYSINFO_PATH,
 };
 
 pub const USAGE: &str = "\
@@ -39,6 +39,11 @@ Commands:
   watch locks                   Print Caps Lock and Num Lock now and on every change
   watch compositor              Print the workspaces, windows and keyboard layout of Sway, Niri or
                                 Mango now and on every change
+  watch brightness              Print the brightness in percent and its backend now and on every change
+  brightness [get]              Print the brightness in percent, or -1 when there is nothing to read
+  brightness set PERCENT        Set the brightness
+  brightness raise|lower        Raise or lower the brightness by 5 percent
+  brightness backend            Print backlight, ddc or none
   clipboard list OFFSET LIMIT   Print a page of the clipboard history
   clipboard pin ID              Pin or unpin an entry
   clipboard delete ID           Delete an entry
@@ -65,6 +70,7 @@ const HIDDEN_PROPERTIES: &[&str] = &["Samples", "Ready"];
 enum Lease {
     Every(Duration),
     Session,
+    Plain,
 }
 
 #[derive(Debug)]
@@ -149,6 +155,8 @@ fn command(args: &[String]) -> Result<()> {
         }
         ["watch", "locks"] => watch(LOCKS_PATH, LOCKS_INTERFACE, Lease::Every(LOCKS_INTERVAL)),
         ["watch", "compositor"] => watch(COMPOSITOR_PATH, COMPOSITOR_INTERFACE, Lease::Session),
+        ["watch", "brightness"] => watch(BRIGHTNESS_PATH, BRIGHTNESS_INTERFACE, Lease::Plain),
+        ["brightness", rest @ ..] => brightness(rest),
         ["clipboard", rest @ ..] => clipboard(rest, options.get("cache-dir").copied()),
         [] => Err(usage("no command")),
         _ => Err(usage(format!("unknown command: {}", positional.join(" ")))),
@@ -275,6 +283,9 @@ fn subscribe(conn: &Connection, path: &str, interface: &str, lease: Lease) -> Re
         Lease::Session => {
             proxy.call_method("Subscribe", &(Session::from_env().vars(),))?;
         }
+        Lease::Plain => {
+            proxy.call_method("Subscribe", &())?;
+        }
     }
     Ok(())
 }
@@ -316,7 +327,7 @@ fn watch(path: &'static str, interface: &'static str, lease: Lease) -> Result<()
             subscribe(&conn, path, interface, lease)?;
             let mut state = state.lock().unwrap();
             let (values, current) = snapshot(&props, interface)?;
-            *state = (values, current || !matches!(lease, Lease::Session));
+            *state = (values, current || matches!(lease, Lease::Every(_)));
             if current {
                 print(&Json::Object(state.0.clone()).to_string());
             }
@@ -357,6 +368,28 @@ fn watch(path: &'static str, interface: &'static str, lease: Lease) -> Result<()
         }
     }
     Err(failed("lost the session bus"))
+}
+
+fn brightness(args: &[&str]) -> Result<()> {
+    let conn = connect()?;
+    start(&conn)?;
+    let proxy = Proxy::new(&conn, BUS_NAME, BRIGHTNESS_PATH, BRIGHTNESS_INTERFACE)?;
+    let percent: i32 = match args {
+        [] | ["get"] => proxy.call("Get", &())?,
+        ["set", value] => {
+            let value = value.parse::<i64>().map_err(|_| usage(format!("not a number: {value}")))?;
+            proxy.call("Set", &(value.clamp(0, 100) as u32,))?
+        }
+        ["raise"] => proxy.call("Step", &(true,))?,
+        ["lower"] => proxy.call("Step", &(false,))?,
+        ["backend"] => {
+            print(&proxy.get_property::<String>("Backend")?);
+            return Ok(());
+        }
+        _ => return Err(usage("brightness takes get, set PERCENT, raise, lower or backend")),
+    };
+    print(&percent.to_string());
+    Ok(())
 }
 
 fn default_cache_dir() -> PathBuf {

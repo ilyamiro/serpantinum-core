@@ -2,6 +2,7 @@
 //! taken with `Subscribe` and ended by `Unsubscribe` or by the client leaving the bus.
 
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use zbus::message::Header;
 use zbus::zvariant::Value;
 use zbus::{fdo, interface};
 
+use crate::brightness::{self, Backend, Change, Ddc};
 use crate::clipboard;
 use crate::compositor::{self, Session, Waker};
 use crate::leases::Leases;
@@ -24,6 +26,8 @@ pub const LOCKS_PATH: &str = "/locks";
 pub const LOCKS_INTERFACE: &str = "org.serpantinum.Core.Locks";
 pub const CLIPBOARD_PATH: &str = "/clipboard";
 pub const CLIPBOARD_INTERFACE: &str = "org.serpantinum.Core.Clipboard";
+pub const BRIGHTNESS_PATH: &str = "/brightness";
+pub const BRIGHTNESS_INTERFACE: &str = "org.serpantinum.Core.Brightness";
 pub const COMPOSITOR_PATH: &str = "/compositor";
 pub const COMPOSITOR_INTERFACE: &str = "org.serpantinum.Core.Compositor";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
@@ -321,6 +325,129 @@ impl CompositorFeed {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct BrightnessState {
+    backend: Backend,
+    percent: i32,
+    ready: bool,
+}
+
+impl BrightnessState {
+    fn properties(&self) -> Properties {
+        vec![("Backend", self.backend.name().into()), ("Percent", self.percent.into()), ("Ready", self.ready.into())]
+    }
+}
+
+pub struct BrightnessFeed {
+    pub leases: Leases,
+    waker: Waker,
+    ddc: Ddc,
+    state: Mutex<BrightnessState>,
+    published: Mutex<Properties>,
+}
+
+impl BrightnessFeed {
+    pub fn new() -> Arc<BrightnessFeed> {
+        let state = BrightnessState { backend: Backend::None, percent: -1, ready: false };
+        Arc::new(BrightnessFeed {
+            leases: Leases::default(),
+            waker: Waker::new(),
+            ddc: Ddc::new(&brightness::run_dir()),
+            published: Mutex::new(state.properties()),
+            state: Mutex::new(state),
+        })
+    }
+
+    pub fn remove(&self, owner: &str) {
+        self.leases.remove(owner);
+        self.waker.wake();
+    }
+
+    fn update(&self, update: impl FnOnce(&mut BrightnessState)) {
+        update(&mut self.state.lock().unwrap());
+        self.waker.wake();
+    }
+
+    /// Signals what changed since the last signal
+    fn sync(&self, bus: &zbus::blocking::Connection) {
+        let now = self.state.lock().unwrap().properties();
+        let before = std::mem::replace(&mut *self.published.lock().unwrap(), now.clone());
+        emit(bus, BRIGHTNESS_PATH, BRIGHTNESS_INTERFACE, changed(before, now));
+    }
+
+    /// While anyone watches: reads the brightness, then follows the backlight's files, or for DDC
+    /// takes only the changes made through this daemon
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        loop {
+            self.leases.wait_interval();
+            let backend = brightness::backend();
+            let percent = brightness::get(&self.ddc).unwrap_or(-1);
+            *self.state.lock().unwrap() = BrightnessState { backend, percent, ready: true };
+            let watch = (backend == Backend::Backlight).then(|| brightness_watch(brightness::BACKLIGHT)).flatten();
+            loop {
+                self.sync(bus);
+                let mut fds = vec![self.waker.fd()];
+                fds.extend(watch.as_ref().map(AsRawFd::as_raw_fd));
+                let Some(revents) = locks::wait_readable(&fds) else { break };
+                if revents[0] != 0 {
+                    self.waker.drain();
+                }
+                if !self.leases.active() {
+                    break;
+                }
+                if let Some(watch) = watch.as_ref().filter(|_| revents.get(1).is_some_and(|r| *r != 0)) {
+                    drain(watch);
+                    if let Some(device) = brightness::backlight(Path::new(brightness::BACKLIGHT)) {
+                        self.state.lock().unwrap().percent = device.percent();
+                    }
+                }
+            }
+            self.state.lock().unwrap().ready = false;
+            self.sync(bus);
+        }
+    }
+
+    fn change(&self, change: Change) -> fdo::Result<i32> {
+        match brightness::change(&self.ddc, change) {
+            Ok(percent) => {
+                let percent = percent.unwrap_or(-1);
+                self.update(|s| s.percent = percent);
+                Ok(percent)
+            }
+            Err(error) => {
+                if brightness::backend() == Backend::Ddc {
+                    let percent = self.ddc.get().unwrap_or(-1);
+                    self.update(|s| s.percent = percent);
+                }
+                Err(fdo::Error::Failed(error))
+            }
+        }
+    }
+}
+
+/// An inotify descriptor that turns readable when a backlight's brightness is written
+fn brightness_watch(root: &str) -> Option<OwnedFd> {
+    // SAFETY: inotify_init1 has no preconditions; a valid descriptor is owned from here on
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is a fresh descriptor nothing else owns
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let watched = brightness::backlight_files(Path::new(root)).into_iter().filter(|file| {
+        let Ok(path) = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()) else { return false };
+        // SAFETY: path is a valid C string and fd an inotify descriptor
+        unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), libc::IN_MODIFY) >= 0 }
+    });
+    (watched.count() > 0).then_some(fd)
+}
+
+fn drain(fd: &OwnedFd) {
+    let mut buf = [0u8; 4096];
+    // SAFETY: buf is writable for its whole length
+    while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+}
+
 pub struct Core;
 
 #[interface(name = "org.serpantinum.Core")]
@@ -434,6 +561,59 @@ impl LockState {
     #[zbus(property)]
     fn num_lock(&self) -> bool {
         self.0.state.lock().unwrap().num
+    }
+}
+
+pub struct BrightnessControl(pub Arc<BrightnessFeed>);
+
+#[interface(name = "org.serpantinum.Core.Brightness")]
+impl BrightnessControl {
+    /// Follows the brightness until this client unsubscribes
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
+        self.0.waker.wake();
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    /// The brightness now, read afresh, in percent; -1 when there is nothing to read
+    async fn get(&self) -> i32 {
+        let feed = self.0.clone();
+        blocking::unblock(move || brightness::get(&feed.ddc).unwrap_or(-1)).await
+    }
+
+    /// Sets the brightness in percent and returns what it became
+    async fn set(&self, percent: u32) -> fdo::Result<i32> {
+        let feed = self.0.clone();
+        let percent = percent.min(100) as i32;
+        blocking::unblock(move || feed.change(Change::Set(percent))).await
+    }
+
+    /// Raises (or lowers) the brightness by five percent and returns what it became
+    async fn step(&self, up: bool) -> fdo::Result<i32> {
+        let feed = self.0.clone();
+        blocking::unblock(move || feed.change(Change::Step(up))).await
+    }
+
+    #[zbus(property)]
+    fn backend(&self) -> String {
+        brightness::backend().name().to_owned()
+    }
+
+    /// The brightness last read or set, in percent; -1 when unknown
+    #[zbus(property)]
+    fn percent(&self) -> i32 {
+        self.0.state.lock().unwrap().percent
+    }
+
+    /// False while nobody watches, when `Percent` may be stale
+    #[zbus(property)]
+    fn ready(&self) -> bool {
+        self.0.state.lock().unwrap().ready
     }
 }
 
