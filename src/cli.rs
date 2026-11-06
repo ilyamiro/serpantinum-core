@@ -25,7 +25,7 @@ use crate::dbus::{
     COMPOSITOR_PATH, CORE_INTERFACE, IDLE_INTERFACE, IDLE_PATH, LOCKS_INTERFACE, LOCKS_PATH, SCREENTIME_INTERFACE,
     SCREENTIME_PATH, SCREENTIME_VARS, SYSINFO_INTERFACE, SYSINFO_PATH,
 };
-use crate::screentime;
+use crate::{launcher, screentime, system};
 
 pub const USAGE: &str = "\
 Usage: serpantinum-core [COMMAND]
@@ -54,6 +54,11 @@ Commands:
   screentime track              Count the focused app's screen time while running
   screentime stats [DATE]       Print the screen time statistics of DATE (YYYY-MM-DD, default today);
                                 --app CLASS for one app, --db-dir DIR for another database
+  launcher rank                 Print the launcher's app scores from screen time and launches
+  launcher log NAME             Count a launch of NAME
+  launcher files QUERY          Print files matching QUERY, or completing it when it is a path
+  system can-hibernate          Print yes or no
+  system fingerprint [PAM_DIR]  Exit with 0 when fingerprint unlock is set up, else 1
   clipboard list OFFSET LIMIT   Print a page of the clipboard history
   clipboard pin ID              Pin or unpin an entry
   clipboard delete ID           Delete an entry
@@ -169,6 +174,30 @@ fn command(args: &[String]) -> Result<()> {
         ["brightness", rest @ ..] => brightness(rest),
         ["watch", "idle", marker] => watch_idle(marker),
         ["screentime", "track"] => track_screentime(),
+        ["launcher", "rank"] => {
+            print(&launcher::rank(&launcher::home()).to_string());
+            Ok(())
+        }
+        ["launcher", "log", name] => {
+            launcher::log_launch(&launcher::stats_dir(&launcher::home()), name, screentime::now().date);
+            Ok(())
+        }
+        ["launcher", "files"] => {
+            print(&launcher::files("", &launcher::home()).to_string());
+            Ok(())
+        }
+        ["launcher", "files", query] => {
+            print(&launcher::files(query, &launcher::home()).to_string());
+            Ok(())
+        }
+        ["system", "can-hibernate"] => {
+            print(if system::can_hibernate() { "yes" } else { "no" });
+            Ok(())
+        }
+        ["system", "fingerprint", rest @ ..] if rest.len() <= 1 => {
+            let dir = rest.first().copied().unwrap_or("/etc/pam.d");
+            if system::fingerprint_available(std::path::Path::new(dir)) { Ok(()) } else { std::process::exit(1) }
+        }
         ["screentime", "stats", rest @ ..] if rest.len() <= 1 => {
             screentime_stats(rest.first().copied(), options.get("app").copied(), options.get("db-dir").copied())
         }

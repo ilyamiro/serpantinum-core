@@ -60,6 +60,11 @@ impl Date {
         (self.0 + 3).rem_euclid(7) as usize
     }
 
+    /// Days from `earlier` to this date, negative when `earlier` is later
+    pub fn days_since(self, earlier: Date) -> i64 {
+        self.0 - earlier.0
+    }
+
     pub fn add(self, days: i64) -> Date {
         Date(self.0 + days)
     }

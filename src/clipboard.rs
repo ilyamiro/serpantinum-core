@@ -57,7 +57,7 @@ fn is_image(path: &Path) -> bool {
 }
 
 /// `~/x` in `home` and `~user/x` in that user's home, as a shell expands them
-fn expand_tilde(text: &str, home: &Path) -> Option<PathBuf> {
+pub fn expand_tilde(text: &str, home: &Path) -> Option<PathBuf> {
     let rest = text.strip_prefix('~')?;
     let (user, path) = rest.split_once('/').unwrap_or((rest, ""));
     let base = if user.is_empty() {

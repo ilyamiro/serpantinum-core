@@ -4,10 +4,12 @@ mod clipboard;
 mod compositor;
 mod dbus;
 mod idle;
+mod launcher;
 mod leases;
 mod locks;
 mod screentime;
 mod sysinfo;
+mod system;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
