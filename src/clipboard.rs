@@ -243,7 +243,14 @@ mod tests {
         assert_eq!(image_path(&format!("  {}\n", image.display()), Path::new("/")), Some(image.clone()));
         assert_eq!(image_path("~/shot one.PNG", dir.path()), Some(image));
         assert_eq!(expand_tilde("~", dir.path()), Some(dir.path().to_path_buf()));
-        assert_eq!(expand_tilde("~root/x.png", dir.path()), Some(PathBuf::from("/root/x.png")));
+        // SAFETY: the entry of the current user is read before any other passwd call
+        let (name, home) = unsafe {
+            let entry = libc::getpwuid(libc::getuid());
+            assert!(!entry.is_null());
+            let name = std::ffi::CStr::from_ptr((*entry).pw_name).to_string_lossy().into_owned();
+            (name, PathBuf::from(std::ffi::OsStr::from_bytes(std::ffi::CStr::from_ptr((*entry).pw_dir).to_bytes())))
+        };
+        assert_eq!(expand_tilde(&format!("~{name}/x.png"), dir.path()), Some(home.join("x.png")));
         assert_eq!(expand_tilde("~no-such-user-here/x.png", dir.path()), None);
         assert_eq!(image_path(&dir.path().join("notes.txt").to_string_lossy(), Path::new("/")), None);
         assert_eq!(image_path("hello world", Path::new("/")), None);
