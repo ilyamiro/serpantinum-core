@@ -1,7 +1,7 @@
 # serpantinum-core
 
-A daemon that serves system state, compositor state, brightness, idle inhibition, screen time and
-clipboard history to the
+A daemon that serves system state, compositor state, network state, brightness, idle inhibition,
+screen time and clipboard history to the
 [Serpantinum](https://github.com/ilyamiro/serpantinum) shell over D-Bus. The same binary is its
 command line client, which prints everything as JSON, so the shell reads it from one long-running
 process instead of running scripts on a timer. It works on any compositor and needs only a session
@@ -16,6 +16,7 @@ serpantinum-core watch sysinfo --interval 2   # a sample every 2 seconds until s
 serpantinum-core watch locks                  # Caps Lock and Num Lock, now and on every change
 serpantinum-core watch compositor             # Sway, Niri or Mango workspaces, windows and layout
 serpantinum-core watch brightness             # brightness in percent and its backend
+serpantinum-core watch network                # connectivity, IPv4 addresses and Wi-Fi frequencies
 serpantinum-core brightness set 40            # also get, raise, lower and backend
 serpantinum-core watch idle "$XDG_RUNTIME_DIR/serpantinum/lock/locked"
 serpantinum-core screentime track             # count screen time while running
@@ -23,6 +24,7 @@ serpantinum-core screentime stats 2026-11-06  # a day's screen time statistics
 serpantinum-core launcher rank                # launcher scores from screen time and launches
 serpantinum-core launcher files notes         # files for the launcher's file search
 serpantinum-core monitors                     # outputs in use with their size and refresh rate
+serpantinum-core wallpaper index ~/Pictures/Wallpapers "$XDG_CACHE_HOME/serpantinum/wallpaper"
 serpantinum-core system can-hibernate
 serpantinum-core clipboard list 0 12          # the newest 12 clipboard entries
 serpantinum-core clipboard pin 42
@@ -32,8 +34,8 @@ serpantinum-core notify --app Shot --action default=Open "Saved" "In ~/Pictures"
 serpantinum-core quit
 ```
 
-`serpantinum-core --help` lists every command. Every command except `quit` and `notify` starts the
-daemon when it is not running, and `watch` starts it again if it goes away.
+`serpantinum-core --help` lists every command. Every command except `quit`, `notify` and `wallpaper` starts
+the daemon when it is not running, and `watch` starts it again if it goes away.
 
 Feeds cost nothing while nobody watches them: the daemon samples only while a client holds a lease,
 and the lease ends when that client exits. When several clients watch the same feed, it samples at
@@ -68,6 +70,19 @@ notification closes or the server leaves the bus. It sends what libnotify's `not
 the same options, icon in the `image-path` hint and app name `notify-send` unless given, which the
 tests check against `notify-send` itself.
 
+`watch network` prints NetworkManager's connectivity (`full`, `limited`, `portal`, `none`, or
+`unknown` without NetworkManager) and, for every interface, its first IPv4 address and, when it is
+connected Wi-Fi, its frequency in MHz. Addresses and frequencies come from the kernel through
+rtnetlink and nl80211, so they work under iwd or systemd-networkd too, and their changes arrive as
+netlink events, so nothing is polled.
+
+`wallpaper index` lists the images (JPEG, PNG, WebP, GIF, BMP) and videos in a folder with each
+image's average colour and colour bucket, and a poster frame of each video made with `ffmpeg`.
+Images the decoders here cannot read go to ImageMagick's `magick` or `convert` when installed.
+Files that kept their mtime and size are taken from the previous index, so a second run only
+decodes what changed. A lock in the run directory, the third argument, lets one run index a folder
+at a time; a run that finds it taken prints the last index and makes the running one index again.
+
 The clipboard commands read the history from [cliphist](https://github.com/sentriz/cliphist), which
 must be installed. Decoded images and pins are kept in `--cache-dir`, by default
 `$XDG_CACHE_HOME/serpantinum/clipboard`.
@@ -83,6 +98,7 @@ must be installed. Decoded images and pins are kept in `--cache-dir`, by default
 | `/compositor` | `org.serpantinum.Core.Compositor` | `Subscribe(a{ss} session)`, `Unsubscribe()`, `Name`, `Ready`, `Workspaces`, `Windows`, `Keyboard` (the last three JSON text) |
 | `/brightness` | `org.serpantinum.Core.Brightness` | `Subscribe()`, `Unsubscribe()`, `Get() → i`, `Set(u percent) → i`, `Step(b up) → i`, `Backend`, `Percent`, `Ready` |
 | `/idle` | `org.serpantinum.Core.Idle` | `Subscribe(s marker)`, `Unsubscribe()`, `SetSleepLock(b)`, `Inhibited`; signals `Sleep`, `Wake`, `Log(s)` |
+| `/network` | `org.serpantinum.Core.Network` | `Subscribe()`, `Unsubscribe()`, `Connectivity`, `Interfaces` (JSON text), `Ready` |
 | `/screentime` | `org.serpantinum.Core.ScreenTime` | `Subscribe(a{ss} env)`, `Unsubscribe()` |
 | `/org/freedesktop/ScreenSaver`, `/ScreenSaver` | `org.freedesktop.ScreenSaver` | `Inhibit`, `UnInhibit`, `SimulateUserActivity`, `GetActive`, while `watch idle` runs |
 

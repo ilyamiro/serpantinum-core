@@ -8,10 +8,12 @@ mod launcher;
 mod leases;
 mod locks;
 mod monitors;
+mod network;
 mod notify;
 mod screentime;
 mod sysinfo;
 mod system;
+mod wallpaper;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,8 +23,8 @@ use zbus::fdo::{RequestNameFlags, RequestNameReply};
 
 use crate::dbus::{
     BRIGHTNESS_PATH, BUS_NAME, BrightnessControl, BrightnessFeed, CLIPBOARD_PATH, COMPOSITOR_PATH, Clipboard,
-    Compositor, CompositorFeed, Core, IDLE_PATH, Idle, IdleFeed, LOCKS_PATH, LockFeed, LockState, SCREENTIME_PATH,
-    SYSINFO_PATH, ScreenSaver, ScreenTime, ScreenTimeFeed, SysFeed, SysInfo,
+    Compositor, CompositorFeed, Core, IDLE_PATH, Idle, IdleFeed, LOCKS_PATH, LockFeed, LockState, NETWORK_PATH,
+    Network, NetworkFeed, SCREENTIME_PATH, SYSINFO_PATH, ScreenSaver, ScreenTime, ScreenTimeFeed, SysFeed, SysInfo,
 };
 
 enum Outcome {
@@ -62,6 +64,7 @@ fn run() -> Result<Outcome, String> {
     let compositor = CompositorFeed::new();
     let brightness = BrightnessFeed::new();
     let idle = IdleFeed::new();
+    let network = NetworkFeed::new();
     let screentime = ScreenTimeFeed::new(compositor.clone());
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
 
@@ -77,6 +80,7 @@ fn run() -> Result<Outcome, String> {
     }
     server.at(SCREENTIME_PATH, ScreenTime(screentime.clone())).map_err(|e| e.to_string())?;
     server.at(COMPOSITOR_PATH, Compositor(compositor.clone())).map_err(|e| e.to_string())?;
+    server.at(NETWORK_PATH, Network(network.clone())).map_err(|e| e.to_string())?;
 
     // Listen before taking the name, so no client can subscribe and leave unnoticed
     let departures = DBusProxy::new(&bus).and_then(|p| p.receive_name_owner_changed()).map_err(|e| e.to_string())?;
@@ -118,6 +122,11 @@ fn run() -> Result<Outcome, String> {
         std::thread::spawn(move || feed.run());
     }
 
+    {
+        let (feed, bus) = (network.clone(), bus.clone());
+        std::thread::spawn(move || feed.run(&bus));
+    }
+
     for signal in departures {
         let Ok(args) = signal.args() else { continue };
         if args.new_owner().is_none() {
@@ -126,6 +135,7 @@ fn run() -> Result<Outcome, String> {
             compositor.remove(args.name());
             brightness.remove(args.name());
             idle.remove(args.name());
+            network.remove(args.name());
             screentime.leases.remove(args.name());
         }
     }

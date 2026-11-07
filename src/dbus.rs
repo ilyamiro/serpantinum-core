@@ -18,6 +18,7 @@ use crate::compositor::{self, Session, Waker};
 use crate::idle::{self, Event, Inhibition, SleepLock};
 use crate::leases::Leases;
 use crate::locks::{self, Locks};
+use crate::network;
 use crate::screentime::{self, Notified, Tracker};
 use crate::sysinfo::{Sampler, Usage};
 
@@ -37,6 +38,8 @@ pub const SCREENTIME_PATH: &str = "/screentime";
 pub const SCREENTIME_INTERFACE: &str = "org.serpantinum.Core.ScreenTime";
 pub const COMPOSITOR_PATH: &str = "/compositor";
 pub const COMPOSITOR_INTERFACE: &str = "org.serpantinum.Core.Compositor";
+pub const NETWORK_PATH: &str = "/network";
+pub const NETWORK_INTERFACE: &str = "org.serpantinum.Core.Network";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const MIN_INTERVAL: Duration = Duration::from_millis(100);
 const PRIMING: Duration = Duration::from_millis(250);
@@ -467,6 +470,157 @@ fn drain(fd: &OwnedFd) {
     let mut buf = [0u8; 4096];
     // SAFETY: buf is writable for its whole length
     while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+}
+
+#[derive(Clone, PartialEq)]
+struct NetworkState {
+    connectivity: &'static str,
+    interfaces: String,
+    ready: bool,
+}
+
+impl NetworkState {
+    fn properties(&self) -> Properties {
+        vec![
+            ("Connectivity", self.connectivity.into()),
+            ("Interfaces", self.interfaces.clone().into()),
+            ("Ready", self.ready.into()),
+        ]
+    }
+}
+
+pub struct NetworkFeed {
+    pub leases: Leases,
+    waker: Waker,
+    state: Mutex<NetworkState>,
+    published: Mutex<Properties>,
+}
+
+impl NetworkFeed {
+    pub fn new() -> Arc<NetworkFeed> {
+        let state = NetworkState { connectivity: "unknown", interfaces: "{}".into(), ready: false };
+        Arc::new(NetworkFeed {
+            leases: Leases::default(),
+            waker: Waker::new(),
+            published: Mutex::new(state.properties()),
+            state: Mutex::new(state),
+        })
+    }
+
+    pub fn remove(&self, owner: &str) {
+        self.leases.remove(owner);
+        self.waker.wake();
+    }
+
+    fn set_connectivity(&self, connectivity: &'static str) {
+        self.state.lock().unwrap().connectivity = connectivity;
+        self.waker.wake();
+    }
+
+    fn sync(&self, bus: &zbus::blocking::Connection) {
+        let now = self.state.lock().unwrap().properties();
+        let before = std::mem::replace(&mut *self.published.lock().unwrap(), now.clone());
+        emit(bus, NETWORK_PATH, NETWORK_INTERFACE, changed(before, now));
+    }
+
+    /// While anyone watches: reads the interfaces, then reads them again whenever the kernel signals
+    /// a change of links, addresses or Wi-Fi associations. NetworkManager's connectivity is followed
+    /// alongside, on the system bus.
+    pub fn run(&self, bus: &zbus::blocking::Connection) {
+        std::thread::scope(|scope| {
+            let mut system = None;
+            loop {
+                self.leases.wait_interval();
+                if system.is_none() {
+                    system = zbus::blocking::Connection::system()
+                        .inspect_err(|e| eprintln!("serpantinum-core: cannot connect to the system bus: {e}"))
+                        .ok();
+                    if let Some(system) = system.clone() {
+                        let follower = system.clone();
+                        scope.spawn(move || self.follow_connectivity(&follower));
+                        scope.spawn(move || self.follow_network_manager(&system));
+                    }
+                }
+                if let Some(system) = &system {
+                    self.set_connectivity(nm_connectivity(system));
+                }
+                let watch = network::Watch::open();
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.interfaces = watch.interfaces().to_string();
+                    state.ready = true;
+                }
+                loop {
+                    self.sync(bus);
+                    let mut fds = vec![self.waker.fd()];
+                    fds.extend(watch.fds());
+                    let Some(revents) = locks::wait_readable(&fds) else { break };
+                    if revents[0] != 0 {
+                        self.waker.drain();
+                    }
+                    if !self.leases.active() {
+                        break;
+                    }
+                    if revents[1..].iter().any(|r| *r != 0) {
+                        watch.drain();
+                        self.state.lock().unwrap().interfaces = watch.interfaces().to_string();
+                    }
+                }
+                self.state.lock().unwrap().ready = false;
+                self.sync(bus);
+            }
+        });
+    }
+
+    fn follow_connectivity(&self, system: &zbus::blocking::Connection) {
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender(network::NM_BUS_NAME)
+            .and_then(|r| r.path(network::NM_PATH))
+            .and_then(|r| r.interface(PROPERTIES_INTERFACE))
+            .and_then(|r| r.member("PropertiesChanged"))
+            .map(|r| r.build());
+        let signals = match rule.and_then(|rule| zbus::blocking::MessageIterator::for_match_rule(rule, system, None)) {
+            Ok(signals) => signals,
+            Err(error) => return eprintln!("serpantinum-core: cannot follow NetworkManager: {error}"),
+        };
+        for message in signals.flatten() {
+            let body = message.body();
+            let Ok((interface, changed, _)) =
+                body.deserialize::<(String, HashMap<String, zbus::zvariant::OwnedValue>, Vec<String>)>()
+            else {
+                continue;
+            };
+            if interface != network::NM_BUS_NAME {
+                continue;
+            }
+            if let Some(Value::U32(state)) = changed.get("Connectivity").map(|v| &**v) {
+                self.set_connectivity(network::connectivity_name(*state));
+            }
+        }
+    }
+
+    /// Forgets the connectivity when NetworkManager stops, and reads it when it starts
+    fn follow_network_manager(&self, system: &zbus::blocking::Connection) {
+        let owners = zbus::blocking::fdo::DBusProxy::new(system)
+            .and_then(|p| p.receive_name_owner_changed_with_args(&[(0, network::NM_BUS_NAME)]));
+        let owners = match owners {
+            Ok(owners) => owners,
+            Err(error) => return eprintln!("serpantinum-core: cannot follow NetworkManager: {error}"),
+        };
+        for signal in owners {
+            let Ok(args) = signal.args() else { continue };
+            let connectivity = if args.new_owner().is_some() { nm_connectivity(system) } else { "unknown" };
+            self.set_connectivity(connectivity);
+        }
+    }
+}
+
+/// NetworkManager's connectivity, or unknown without NetworkManager, as nmcli would print it
+fn nm_connectivity(system: &zbus::blocking::Connection) -> &'static str {
+    zbus::blocking::Proxy::new(system, network::NM_BUS_NAME, network::NM_PATH, network::NM_BUS_NAME)
+        .and_then(|proxy| proxy.get_property::<u32>("Connectivity"))
+        .map_or("unknown", network::connectivity_name)
 }
 
 #[derive(Default)]
@@ -982,6 +1136,42 @@ impl BrightnessControl {
     }
 
     /// False while nobody watches, when `Percent` may be stale
+    #[zbus(property)]
+    fn ready(&self) -> bool {
+        self.0.state.lock().unwrap().ready
+    }
+}
+
+pub struct Network(pub Arc<NetworkFeed>);
+
+#[interface(name = "org.serpantinum.Core.Network")]
+impl Network {
+    /// Follows the network until this client unsubscribes
+    fn subscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.leases.add(&owner(&header)?, MIN_INTERVAL);
+        self.0.waker.wake();
+        Ok(())
+    }
+
+    fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
+        self.0.remove(&owner(&header)?);
+        Ok(())
+    }
+
+    /// NetworkManager's connectivity: full, limited, portal, none, or unknown without it
+    #[zbus(property)]
+    fn connectivity(&self) -> String {
+        self.0.state.lock().unwrap().connectivity.to_owned()
+    }
+
+    /// JSON text: every interface with its first IPv4 address and, for connected Wi-Fi, its
+    /// frequency in MHz
+    #[zbus(property)]
+    fn interfaces(&self) -> String {
+        self.0.state.lock().unwrap().interfaces.clone()
+    }
+
+    /// False while nobody watches, when the rest may be stale
     #[zbus(property)]
     fn ready(&self) -> bool {
         self.0.state.lock().unwrap().ready

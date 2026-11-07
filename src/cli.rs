@@ -22,10 +22,10 @@ use zbus::zvariant::Value;
 use crate::compositor::{SESSION_VARS, Session};
 use crate::dbus::{
     BRIGHTNESS_INTERFACE, BRIGHTNESS_PATH, BUS_NAME, CLIPBOARD_INTERFACE, CLIPBOARD_PATH, COMPOSITOR_INTERFACE,
-    COMPOSITOR_PATH, CORE_INTERFACE, IDLE_INTERFACE, IDLE_PATH, LOCKS_INTERFACE, LOCKS_PATH, SCREENTIME_INTERFACE,
-    SCREENTIME_PATH, SCREENTIME_VARS, SYSINFO_INTERFACE, SYSINFO_PATH,
+    COMPOSITOR_PATH, CORE_INTERFACE, IDLE_INTERFACE, IDLE_PATH, LOCKS_INTERFACE, LOCKS_PATH, NETWORK_INTERFACE,
+    NETWORK_PATH, SCREENTIME_INTERFACE, SCREENTIME_PATH, SCREENTIME_VARS, SYSINFO_INTERFACE, SYSINFO_PATH,
 };
-use crate::{launcher, monitors, notify, screentime, system};
+use crate::{launcher, monitors, notify, screentime, system, wallpaper};
 
 pub const USAGE: &str = "\
 Usage: serpantinum-core [COMMAND]
@@ -42,6 +42,8 @@ Commands:
   watch compositor              Print the workspaces, windows and keyboard layout of Sway, Niri or
                                 Mango now and on every change
   watch brightness              Print the brightness in percent and its backend now and on every change
+  watch network                 Print NetworkManager's connectivity and every interface's first IPv4
+                                address and Wi-Fi frequency in MHz now and on every change
   watch idle MARKER             Serve org.freedesktop.ScreenSaver while running and print
                                 \"inhibit 1\" or \"inhibit 0\" when apps start or stop inhibiting idle,
                                 \"sleep\" and \"wake\" around sleep, and \"log ...\" lines. Reads
@@ -60,6 +62,11 @@ Commands:
   monitors                      Print the outputs in use with their size and refresh rate
   system can-hibernate          Print yes or no
   system fingerprint [PAM_DIR]  Exit with 0 when fingerprint unlock is set up, else 1
+  wallpaper index DIR CACHE_DIR [RUN_DIR]
+                                Index the images and videos in DIR for the wallpaper picker: their
+                                average colour and colour bucket, and a poster frame of each video
+                                made with ffmpeg. Keeps the index in CACHE_DIR and its lock in
+                                RUN_DIR (default CACHE_DIR), and prints it. Needs no daemon
   clipboard list OFFSET LIMIT   Print a page of the clipboard history
   clipboard pin ID              Pin or unpin an entry
   clipboard delete ID           Delete an entry
@@ -83,7 +90,7 @@ const POLL: Duration = Duration::from_millis(20);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 const LOCKS_INTERVAL: Duration = Duration::from_millis(250);
 /// Properties served as JSON text, printed as the JSON they hold
-const JSON_PROPERTIES: &[&str] = &["Workspaces", "Windows", "Keyboard"];
+const JSON_PROPERTIES: &[&str] = &["Workspaces", "Windows", "Keyboard", "Interfaces"];
 /// Properties that steer the output instead of being part of it
 const HIDDEN_PROPERTIES: &[&str] = &["Samples", "Ready"];
 
@@ -183,6 +190,7 @@ fn command(args: &[String]) -> Result<()> {
         ["watch", "locks"] => watch(LOCKS_PATH, LOCKS_INTERFACE, Lease::Every(LOCKS_INTERVAL)),
         ["watch", "compositor"] => watch(COMPOSITOR_PATH, COMPOSITOR_INTERFACE, Lease::Session),
         ["watch", "brightness"] => watch(BRIGHTNESS_PATH, BRIGHTNESS_INTERFACE, Lease::Plain),
+        ["watch", "network"] => watch(NETWORK_PATH, NETWORK_INTERFACE, Lease::Plain),
         ["brightness", rest @ ..] => brightness(rest),
         ["watch", "idle", marker] => watch_idle(marker),
         ["screentime", "track"] => track_screentime(),
@@ -221,6 +229,13 @@ fn command(args: &[String]) -> Result<()> {
             screentime_stats(rest.first().copied(), options.get("app").copied(), options.get("db-dir").copied())
         }
         ["clipboard", rest @ ..] => clipboard(rest, options.get("cache-dir").copied()),
+        ["wallpaper", "index", src, cache, rest @ ..] if rest.len() <= 1 => {
+            let run = rest.first().copied().unwrap_or(cache);
+            let index =
+                wallpaper::index(src, std::path::Path::new(cache), std::path::Path::new(run)).map_err(failed)?;
+            print(index.trim_end());
+            Ok(())
+        }
         [] => Err(usage("no command")),
         _ => Err(usage(format!("unknown command: {}", positional.join(" ")))),
     }
