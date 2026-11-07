@@ -281,6 +281,18 @@ fn sent_by(bus: &Bus, mut program: Command, waits: bool, click: Option<&str>) ->
     (n, output.status.success(), stdout(&output).to_string())
 }
 
+/// Hints libnotify only sends from 0.8.8, which also moved the icon from the app icon field to the
+/// `image-path` hint. `notify` sends what 0.8.8 sends, and against an older notify-send only the
+/// icon's place and these hints may differ.
+const OLD_LIBNOTIFY_HINTS: &[&str] = &["sender-pid", "image-path"];
+
+fn libnotify_version() -> (u32, u32, u32) {
+    let output = Command::new("notify-send").arg("--version").output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.split_whitespace().last().unwrap_or_default().split('.').map(|p| p.parse().unwrap_or(0));
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+}
+
 #[test]
 fn matches_notify_send() {
     let bus = need_bus!();
@@ -289,6 +301,7 @@ fn matches_notify_send() {
         eprintln!("no notify-send, skipped");
         return;
     }
+    let modern = libnotify_version() >= (0, 8, 8);
     let cases: &[(&[&str], &[&str], Option<&str>)] = &[
         (&["--app", "Shot", "Saved", "Body"], &["-a", "Shot", "Saved", "Body"], None),
         (&["--icon", "dialog-warning", "--urgency", "low", "S"], &["-i", "dialog-warning", "-u", "low", "S"], None),
@@ -317,17 +330,25 @@ fn matches_notify_send() {
         assert_eq!((a_ok, &a_out), (b_ok, &b_out), "{ours:?}");
         assert_eq!(a_out, click.map(|c| format!("{c}\n")).unwrap_or_default(), "{ours:?}");
         assert_eq!(
-            (&a.app, &a.icon, &a.summary, &a.body, &a.actions, a.expire),
-            (&b.app, &b.icon, &b.summary, &b.body, &b.actions, b.expire),
+            (&a.app, &a.summary, &a.body, &a.actions, a.expire, a.hints.get("urgency")),
+            (&b.app, &b.summary, &b.body, &b.actions, b.expire, b.hints.get("urgency")),
             "{ours:?}"
         );
-        let mut a_hints: Vec<&String> = a.hints.keys().collect();
-        let mut b_hints: Vec<&String> = b.hints.keys().collect();
-        a_hints.sort();
-        b_hints.sort();
-        assert_eq!(a_hints, b_hints, "{ours:?}");
-        for hint in ["urgency", "image-path"] {
-            assert_eq!(a.hints.get(hint), b.hints.get(hint), "{hint} {ours:?}");
+        let hint_names = |n: &Received| {
+            let mut names: Vec<String> =
+                n.hints.keys().filter(|k| modern || !OLD_LIBNOTIFY_HINTS.contains(&k.as_str())).cloned().collect();
+            names.sort();
+            names
+        };
+        assert_eq!(hint_names(&a), hint_names(&b), "{ours:?}");
+        let icon = |n: &Received| {
+            n.hints.get("image-path").map(|v| <&str>::try_from(v).unwrap().to_string()).unwrap_or_default()
+        };
+        if modern {
+            assert_eq!((&a.icon, icon(&a)), (&b.icon, icon(&b)), "{ours:?}");
+        } else {
+            let theirs = if b.icon.is_empty() { icon(&b) } else { b.icon.clone() };
+            assert_eq!(icon(&a), theirs, "{ours:?}");
         }
     }
 }
