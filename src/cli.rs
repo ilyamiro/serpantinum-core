@@ -25,7 +25,7 @@ use crate::dbus::{
     COMPOSITOR_PATH, CORE_INTERFACE, IDLE_INTERFACE, IDLE_PATH, LOCKS_INTERFACE, LOCKS_PATH, SCREENTIME_INTERFACE,
     SCREENTIME_PATH, SCREENTIME_VARS, SYSINFO_INTERFACE, SYSINFO_PATH,
 };
-use crate::{launcher, monitors, screentime, system};
+use crate::{launcher, monitors, notify, screentime, system};
 
 pub const USAGE: &str = "\
 Usage: serpantinum-core [COMMAND]
@@ -64,8 +64,14 @@ Commands:
   clipboard pin ID              Pin or unpin an entry
   clipboard delete ID           Delete an entry
   clipboard wipe                Delete the whole history
+  notify [OPTIONS] SUMMARY [BODY]
+                                Show a desktop notification. Options: --app NAME, --icon ICON
+                                (a name or a path), --urgency low|normal|critical, and
+                                --action NAME=LABEL for a button, repeatable. With buttons it waits and prints the name
+                                of the one clicked, or nothing when the notification closes. Text
+                                after -- is never read as an option. Needs no daemon
 
-Every command prints JSON, one object or array per line.
+Every command except notify prints JSON, one object or array per line.
 
 Options:
   --cache-dir DIR  Where clipboard commands keep decoded images and pins
@@ -153,6 +159,11 @@ fn options(args: &[String]) -> Result<(Vec<&str>, HashMap<&str, &str>)> {
 }
 
 fn command(args: &[String]) -> Result<()> {
+    if let Some((first, rest)) = args.split_first()
+        && first == "notify"
+    {
+        return notify_command(rest);
+    }
     let (positional, options) = options(args)?;
     if let Some(name) = options.keys().find(|n| !matches!(**n, "interval" | "cache-dir" | "app" | "db-dir")) {
         return Err(usage(format!("unknown option --{name}")));
@@ -213,6 +224,14 @@ fn command(args: &[String]) -> Result<()> {
         [] => Err(usage("no command")),
         _ => Err(usage(format!("unknown command: {}", positional.join(" ")))),
     }
+}
+
+fn notify_command(args: &[String]) -> Result<()> {
+    let request = notify::parse(args).map_err(usage)?;
+    if let Some(action) = notify::send(&request).map_err(|e| failed(format!("cannot notify: {e}")))? {
+        print(&action);
+    }
+    Ok(())
 }
 
 fn connect() -> Result<Connection> {

@@ -8,6 +8,7 @@ mod launcher;
 mod leases;
 mod locks;
 mod monitors;
+mod notify;
 mod screentime;
 mod sysinfo;
 mod system;
