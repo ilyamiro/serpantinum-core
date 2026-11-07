@@ -23,7 +23,12 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           test "v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} but Cargo.toml says $version"; exit 1; }
 
+      - name: Install what the notify tests run against
+        run: sudo apt-get update && sudo apt-get install -y dbus libnotify-bin
+
       - run: cargo test --locked
+        env:
+          SERPANTINUM_REQUIRE_DBUS: "1"
 
       - run: cargo build --release --locked
 
