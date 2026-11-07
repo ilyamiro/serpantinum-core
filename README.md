@@ -28,11 +28,12 @@ serpantinum-core clipboard list 0 12          # the newest 12 clipboard entries
 serpantinum-core clipboard pin 42
 serpantinum-core clipboard delete 42
 serpantinum-core clipboard wipe
+serpantinum-core notify --app Shot --action default=Open "Saved" "In ~/Pictures"
 serpantinum-core quit
 ```
 
-`serpantinum-core --help` lists every command. Every command except `quit` starts the daemon when
-it is not running, and `watch` starts it again if it goes away.
+`serpantinum-core --help` lists every command. Every command except `quit` and `notify` starts the
+daemon when it is not running, and `watch` starts it again if it goes away.
 
 Feeds cost nothing while nobody watches them: the daemon samples only while a client holds a lease,
 and the lease ends when that client exits. When several clients watch the same feed, it samples at
@@ -59,6 +60,13 @@ not writable, else the first DDC/CI display through `ddcutil`. `watch idle` serv
 logind sleep delay inhibitor until the lock screen's marker file appears. Screen time counts the
 focused app once a second into the shell's sqlite database, and notifies when a daily limit from
 the shell's settings is reached.
+
+`notify` sends a notification to whichever server owns `org.freedesktop.Notifications` on the
+session bus, with `--app`, `--icon` and `--urgency`. Each `--action NAME=LABEL` adds a button. With
+buttons it waits and prints the name of the one clicked, or exits printing nothing when the
+notification closes or the server leaves the bus. It sends what libnotify's `notify-send` sends for
+the same options, icon in the `image-path` hint and app name `notify-send` unless given, which the
+tests check against `notify-send` itself.
 
 The clipboard commands read the history from [cliphist](https://github.com/sentriz/cliphist), which
 must be installed. Decoded images and pins are kept in `--cache-dir`, by default
