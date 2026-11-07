@@ -268,8 +268,19 @@ fn rejects_bad_usage_before_touching_the_bus() {
 fn sent_by(bus: &Bus, mut program: Command, waits: bool, click: Option<&str>) -> (Received, bool, String) {
     let (conn, received) = server(bus, 1);
     program.env("DBUS_SESSION_BUS_ADDRESS", &bus.address).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let child = program.spawn().unwrap();
-    let (id, n) = first_notification(&received);
+    let mut child = program.spawn().unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let (id, n) = loop {
+        if let Some(first) = received.lock().unwrap().first() {
+            break first.clone();
+        }
+        if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = finish(child);
+            panic!("{program:?} sent nothing: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        sleep(Duration::from_millis(20));
+    };
     if waits {
         sleep(Duration::from_millis(200));
         if let Some(action) = click {
@@ -319,8 +330,16 @@ fn matches_notify_send() {
         (&["--action", "default=Open", "S"], &["-A", "default=Open", "S"], Some("default")),
         (&["--action", "default=Open", "S"], &["-A", "default=Open", "S"], None),
     ];
+    let with_actions = Command::new("notify-send")
+        .arg("--help")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("--action"));
     for (ours, theirs, click) in cases {
         let waits = ours.contains(&"--action");
+        if waits && !with_actions {
+            eprintln!("this notify-send has no --action, skipped {ours:?}");
+            continue;
+        }
         let mut our_program = Command::new(env!("CARGO_BIN_EXE_serpantinum-core"));
         our_program.arg("notify").args(*ours);
         let mut their_program = Command::new("notify-send");
