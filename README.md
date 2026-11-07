@@ -22,6 +22,7 @@ serpantinum-core screentime track             # count screen time while running
 serpantinum-core screentime stats 2026-11-06  # a day's screen time statistics
 serpantinum-core launcher rank                # launcher scores from screen time and launches
 serpantinum-core launcher files notes         # files for the launcher's file search
+serpantinum-core monitors                     # outputs in use with their size and refresh rate
 serpantinum-core system can-hibernate
 serpantinum-core clipboard list 0 12          # the newest 12 clipboard entries
 serpantinum-core clipboard pin 42
@@ -47,6 +48,10 @@ The compositor feed speaks each compositor's own socket: Sway's i3-ipc, Niri's J
 Mango's IPC socket, so following them costs no processes. Every watcher passes the variables that
 locate its compositor, because the daemon may outlive a login. Of Hyprland, which the shell reads
 natively, only the focused window is followed, for screen time.
+
+`monitors` asks the same sockets, and Hyprland's, for the outputs in use. On other compositors it
+asks for the Wayland outputs (`wl_output` 4 or later), and without a compositor it lists the
+connectors the kernel reports connected.
 
 Brightness drives the first backlight in `/sys/class/backlight`, through logind when its file is
 not writable, else the first DDC/CI display through `ddcutil`. `watch idle` serves

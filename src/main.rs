@@ -7,6 +7,7 @@ mod idle;
 mod launcher;
 mod leases;
 mod locks;
+mod monitors;
 mod screentime;
 mod sysinfo;
 mod system;

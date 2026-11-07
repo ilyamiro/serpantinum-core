@@ -5,10 +5,10 @@
 //! The daemon may outlive a login, so it does not trust its own environment: every watcher passes
 //! the variables that locate its compositor, and the latest one wins.
 
-mod hyprland;
-mod mango;
-mod niri;
-mod sway;
+pub mod hyprland;
+pub mod mango;
+pub mod niri;
+pub mod sway;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};

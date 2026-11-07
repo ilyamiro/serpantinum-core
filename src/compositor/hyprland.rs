@@ -17,6 +17,15 @@ fn socket_dir(session: &Session) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Hyprland socket"))
 }
 
+/// The reply to one request on the request socket
+pub fn request(session: &Session, command: &str) -> io::Result<String> {
+    let mut stream = unix(socket_dir(session)?.join(".socket.sock"))?;
+    stream.write_all(command.as_bytes())?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    Ok(reply)
+}
+
 /// The class and title of the window in a `j/activewindow` reply, preferring the initial ones
 pub fn parse_active_window(reply: &str) -> Option<(String, String)> {
     let window: Json = serde_json::from_str(reply).ok()?;

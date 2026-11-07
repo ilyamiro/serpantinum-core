@@ -25,7 +25,7 @@ use crate::dbus::{
     COMPOSITOR_PATH, CORE_INTERFACE, IDLE_INTERFACE, IDLE_PATH, LOCKS_INTERFACE, LOCKS_PATH, SCREENTIME_INTERFACE,
     SCREENTIME_PATH, SCREENTIME_VARS, SYSINFO_INTERFACE, SYSINFO_PATH,
 };
-use crate::{launcher, screentime, system};
+use crate::{launcher, monitors, screentime, system};
 
 pub const USAGE: &str = "\
 Usage: serpantinum-core [COMMAND]
@@ -57,6 +57,7 @@ Commands:
   launcher rank                 Print the launcher's app scores from screen time and launches
   launcher log NAME             Count a launch of NAME
   launcher files QUERY          Print files matching QUERY, or completing it when it is a path
+  monitors                      Print the outputs in use with their size and refresh rate
   system can-hibernate          Print yes or no
   system fingerprint [PAM_DIR]  Exit with 0 when fingerprint unlock is set up, else 1
   clipboard list OFFSET LIMIT   Print a page of the clipboard history
@@ -188,6 +189,13 @@ fn command(args: &[String]) -> Result<()> {
         }
         ["launcher", "files", query] => {
             print(&launcher::files(query, &launcher::home()).to_string());
+            Ok(())
+        }
+        ["monitors"] => {
+            print(
+                &Json::Array(monitors::list(&Session::from_env()).iter().map(monitors::Monitor::json).collect())
+                    .to_string(),
+            );
             Ok(())
         }
         ["system", "can-hibernate"] => {

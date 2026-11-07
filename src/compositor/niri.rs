@@ -181,6 +181,15 @@ impl Model {
     }
 }
 
+/// What niri answers to one request, inside its `Ok`
+pub fn request(session: &Session, request: &str) -> io::Result<Json> {
+    let path = session.get("NIRI_SOCKET").ok_or_else(|| missing("NIRI_SOCKET"))?;
+    let mut lines = Lines::new(unix(path)?);
+    lines.stream.write_all(format!("\"{request}\"\n").as_bytes())?;
+    let mut reply: Json = serde_json::from_str(&lines.read_line()?).map_err(io::Error::other)?;
+    reply.get_mut("Ok").map(Json::take).ok_or_else(|| io::Error::other(format!("niri refused {request}: {reply}")))
+}
+
 pub struct Niri {
     events: Lines,
     model: Model,

@@ -52,6 +52,14 @@ pub fn tags(payload: &Json) -> Json {
     })
 }
 
+/// The reply to one `get` command
+pub fn request(session: &Session, command: &str) -> io::Result<Json> {
+    let path = session.get("MANGO_INSTANCE_SIGNATURE").ok_or_else(|| missing("MANGO_INSTANCE_SIGNATURE"))?;
+    let mut lines = Lines::new(unix(path)?);
+    lines.stream.write_all(format!("{command}\n").as_bytes())?;
+    serde_json::from_str(&lines.read_line()?).map_err(io::Error::other)
+}
+
 pub struct Mango {
     streams: Vec<Lines>,
     state: State,

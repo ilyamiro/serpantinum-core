@@ -14,6 +14,7 @@ const MAGIC: &[u8; 6] = b"i3-ipc";
 const HEADER: usize = 14;
 const GET_WORKSPACES: u32 = 1;
 const SUBSCRIBE: u32 = 2;
+pub const GET_OUTPUTS: u32 = 3;
 const GET_TREE: u32 = 4;
 const GET_INPUTS: u32 = 100;
 const EVENT: u32 = 0x8000_0000;
@@ -80,6 +81,11 @@ pub fn request(stream: &mut UnixStream, kind: u32, payload: &[u8]) -> io::Result
             n => pending.extend_from_slice(&buf[..n]),
         }
     }
+}
+
+/// Asks the session's Sway once, on a connection of its own
+pub fn ask(session: &Session, kind: u32) -> io::Result<Json> {
+    request(&mut unix(socket(session)?)?, kind, b"")
 }
 
 /// A workspace's position: its number less one, else the given fallback
