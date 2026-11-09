@@ -257,9 +257,19 @@ fn running(conn: &Connection) -> Result<bool> {
     Ok(DBusProxy::new(conn)?.name_has_owner(BusName::try_from(BUS_NAME)?)?)
 }
 
+/// The version of the daemon on the bus, or None when it serves none
+fn daemon_version(conn: &Connection) -> Option<String> {
+    Proxy::new(conn, BUS_NAME, "/", CORE_INTERFACE).ok()?.get_property::<String>("Version").ok()
+}
+
+/// Starts the daemon unless one of this version runs. A daemon of another version, left running
+/// by an upgrade, is stopped first, since it may lack what this client asks for.
 fn start(conn: &Connection) -> Result<()> {
     if running(conn)? {
-        return Ok(());
+        if daemon_version(conn).as_deref() == Some(env!("CARGO_PKG_VERSION")) {
+            return Ok(());
+        }
+        stop(conn)?;
     }
     let exe = std::env::current_exe().map_err(|e| failed(format!("cannot find this program: {e}")))?;
     let mut daemon = Command::new(exe);
@@ -294,10 +304,14 @@ fn quit() -> Result<()> {
     if !running(&conn)? {
         return Ok(());
     }
-    Proxy::new(&conn, BUS_NAME, "/", CORE_INTERFACE)?.call_method("Quit", &())?;
+    stop(&conn)
+}
+
+fn stop(conn: &Connection) -> Result<()> {
+    Proxy::new(conn, BUS_NAME, "/", CORE_INTERFACE)?.call_method("Quit", &())?;
     let deadline = Instant::now() + WAIT;
     while Instant::now() < deadline {
-        if !running(&conn)? {
+        if !running(conn)? {
             return Ok(());
         }
         sleep(POLL);
