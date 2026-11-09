@@ -242,7 +242,7 @@ mod tests {
         assert_eq!(rate(0.0), json!(0));
         assert_eq!(
             monitor("DP-1", 2560, 1440, 59.951).json().to_string(),
-            r#"{"height":1440,"name":"DP-1","refreshRate":59.95,"width":2560}"#
+            r#"{"name":"DP-1","width":2560,"height":1440,"refreshRate":59.95}"#
         );
     }
 

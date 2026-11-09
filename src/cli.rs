@@ -25,7 +25,7 @@ use crate::dbus::{
     COMPOSITOR_PATH, CORE_INTERFACE, IDLE_INTERFACE, IDLE_PATH, LOCKS_INTERFACE, LOCKS_PATH, NETWORK_INTERFACE,
     NETWORK_PATH, SCREENTIME_INTERFACE, SCREENTIME_PATH, SCREENTIME_VARS, SYSINFO_INTERFACE, SYSINFO_PATH,
 };
-use crate::{launcher, monitors, notify, screentime, system, wallpaper};
+use crate::{launcher, monitors, notify, presets, screentime, system, wallpaper};
 
 pub const USAGE: &str = "\
 Usage: serpantinum-core [COMMAND]
@@ -67,6 +67,13 @@ Commands:
                                 average colour and colour bucket, and a poster frame of each video
                                 made with ffmpeg. Keeps the index in CACHE_DIR and its lock in
                                 RUN_DIR (default CACHE_DIR), and prints it. Needs no daemon
+  presets MODE PRESETS_DIR WIDGETS_DIR [PRESET_PATH] [JSON]
+                                Manage the settings presets in PRESETS_DIR and print them, oldest
+                                first. MODE is list; save, which stores the JSON as the preset
+                                PRESET_PATH with the layouts in WIDGETS_DIR and deletes the
+                                screenshots it no longer uses; widgets, which replaces the widgets
+                                snapshot of PRESET_PATH with the JSON and prints nothing; or delete.
+                                Needs no daemon
   clipboard list OFFSET LIMIT   Print a page of the clipboard history
   clipboard pin ID              Pin or unpin an entry
   clipboard delete ID           Delete an entry
@@ -234,6 +241,19 @@ fn command(args: &[String]) -> Result<()> {
             let index =
                 wallpaper::index(src, std::path::Path::new(cache), std::path::Path::new(run)).map_err(failed)?;
             print(index.trim_end());
+            Ok(())
+        }
+        ["presets", mode, presets_dir, widgets_dir, rest @ ..] if rest.len() <= 2 => {
+            let request = presets::Request {
+                mode,
+                presets_dir: std::path::Path::new(presets_dir),
+                widgets_dir: std::path::Path::new(widgets_dir),
+                path: rest.first().map(std::path::Path::new),
+                json: rest.get(1).copied(),
+            };
+            if let Some(line) = presets::run(&request).map_err(failed)? {
+                print(&line);
+            }
             Ok(())
         }
         [] => Err(usage("no command")),
@@ -716,6 +736,6 @@ mod tests {
         let mut state = Map::new();
         let (windows, name) = (Value::from(r#"[{"id":1}]"#), Value::from("[sway]"));
         merge(&mut state, [("Windows", &windows), ("Name", &name)]);
-        assert_eq!(Json::Object(state).to_string(), r#"{"name":"[sway]","windows":[{"id":1}]}"#);
+        assert_eq!(Json::Object(state).to_string(), r#"{"windows":[{"id":1}],"name":"[sway]"}"#);
     }
 }

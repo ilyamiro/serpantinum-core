@@ -25,6 +25,7 @@ serpantinum-core launcher rank                # launcher scores from screen time
 serpantinum-core launcher files notes         # files for the launcher's file search
 serpantinum-core monitors                     # outputs in use with their size and refresh rate
 serpantinum-core wallpaper index ~/Pictures/Wallpapers "$XDG_CACHE_HOME/serpantinum/wallpaper"
+serpantinum-core presets list "$XDG_STATE_HOME/serpantinum/presets" "$XDG_STATE_HOME/serpantinum/widgets"
 serpantinum-core system can-hibernate
 serpantinum-core clipboard list 0 12          # the newest 12 clipboard entries
 serpantinum-core clipboard pin 42
@@ -34,7 +35,7 @@ serpantinum-core notify --app Shot --action default=Open "Saved" "In ~/Pictures"
 serpantinum-core quit
 ```
 
-`serpantinum-core --help` lists every command. Every command except `quit`, `notify` and `wallpaper` starts
+`serpantinum-core --help` lists every command. Every command except `quit`, `notify`, `wallpaper` and `presets` starts
 the daemon when it is not running, and `watch` starts it again if it goes away.
 
 Feeds cost nothing while nobody watches them: the daemon samples only while a client holds a lease,
@@ -82,6 +83,13 @@ Images the decoders here cannot read go to ImageMagick's `magick` or `convert` w
 Files that kept their mtime and size are taken from the previous index, so a second run only
 decodes what changed. A lock in the run directory, the third argument, lets one run index a folder
 at a time; a run that finds it taken prints the last index and makes the running one index again.
+
+`presets MODE PRESETS_DIR WIDGETS_DIR [PRESET_PATH] [JSON]` manages the shell's settings presets and
+prints them as one JSON array, oldest first, each with its file name as `id`. `save` stores the JSON
+as the preset `PRESET_PATH` together with the layouts of `WIDGETS_DIR/*/layout.json`, and deletes the
+screenshots the old file used and the new one does not. `widgets` replaces the widgets snapshot of
+`PRESET_PATH` with the JSON and prints nothing, `delete` removes a preset and its screenshots, and
+`list` only lists. Files are written through a temporary file and a rename.
 
 The clipboard commands read the history from [cliphist](https://github.com/sentriz/cliphist), which
 must be installed. Decoded images and pins are kept in `--cache-dir`, by default

@@ -10,6 +10,7 @@ mod locks;
 mod monitors;
 mod network;
 mod notify;
+mod presets;
 mod screentime;
 mod sysinfo;
 mod system;

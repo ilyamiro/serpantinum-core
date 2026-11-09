@@ -358,7 +358,7 @@ mod tests {
         let frequencies = BTreeMap::from([("wlan0".to_owned(), 5180), ("wlan1".to_owned(), 2412)]);
         assert_eq!(
             interfaces_json(&addresses, &frequencies).to_string(),
-            r#"{"lo":{"ipv4":"127.0.0.1"},"wlan0":{"frequency":5180,"ipv4":"192.168.1.5"},"wlan1":{"frequency":2412}}"#
+            r#"{"lo":{"ipv4":"127.0.0.1"},"wlan0":{"ipv4":"192.168.1.5","frequency":5180},"wlan1":{"frequency":2412}}"#
         );
     }
 
