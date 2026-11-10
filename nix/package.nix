@@ -10,6 +10,7 @@ pkgs.rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [ ../Cargo.toml ../Cargo.lock ../src ../assets ../LICENSE ];
   };
   cargoLock.lockFile = ../Cargo.lock;
+  buildInputs = [ pkgs.sqlite ];
 
   postInstall = ''
     install -Dm644 assets/org.serpantinum.Core.service $out/share/dbus-1/services/org.serpantinum.Core.service
