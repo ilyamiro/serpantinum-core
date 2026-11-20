@@ -1,6 +1,6 @@
 //! Workspaces, windows and the keyboard layout of the running compositor, followed over its own
-//! socket while someone watches. Sway, Niri and Mango are served; of Hyprland, which the shell reads
-//! natively, only the focused window is followed, for screen time.
+//! socket while someone watches. Sway, Niri, Mango and Umbriel are served; of Hyprland, which the
+//! shell reads natively, only the focused window is followed, for screen time.
 //!
 //! The daemon may outlive a login, so it does not trust its own environment: every watcher passes
 //! the variables that locate its compositor, and the latest one wins.
@@ -9,6 +9,7 @@ pub mod hyprland;
 pub mod mango;
 pub mod niri;
 pub mod sway;
+pub mod umbriel;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -25,6 +26,7 @@ pub use self::sway::Sway;
 pub const SESSION_VARS: &[&str] = &[
     "NIRI_SOCKET",
     "MANGO_INSTANCE_SIGNATURE",
+    "UMBRIEL_SOCKET",
     "SWAYSOCK",
     "HYPRLAND_INSTANCE_SIGNATURE",
     "XDG_CURRENT_DESKTOP",
@@ -62,6 +64,8 @@ impl Session {
             "niri"
         } else if found("MANGO_INSTANCE_SIGNATURE", "mango") {
             "mango"
+        } else if found("UMBRIEL_SOCKET", "umbriel") {
+            "umbriel"
         } else if found("SWAYSOCK", "sway") {
             "sway"
         } else if found("HYPRLAND_INSTANCE_SIGNATURE", "hyprland") {
@@ -113,6 +117,7 @@ pub fn connect(session: &Session) -> Option<io::Result<Box<dyn Adapter>>> {
         "sway" => Sway::connect(session).map(|a| Box::new(a) as Box<dyn Adapter>),
         "niri" => niri::Niri::connect(session).map(|a| Box::new(a) as Box<dyn Adapter>),
         "mango" => mango::Mango::connect(session).map(|a| Box::new(a) as Box<dyn Adapter>),
+        "umbriel" => umbriel::Umbriel::connect(session).map(|a| Box::new(a) as Box<dyn Adapter>),
         "hyprland" => hyprland::Hyprland::connect(session).map(|a| Box::new(a) as Box<dyn Adapter>),
         _ => return None,
     };
@@ -249,6 +254,10 @@ mod tests {
         assert_eq!(session(&[("SWAYSOCK", "/s"), ("NIRI_SOCKET", "/n")]).compositor(), "niri");
         assert_eq!(session(&[("XDG_CURRENT_DESKTOP", "sway")]).compositor(), "sway");
         assert_eq!(session(&[("DESKTOP_SESSION", "Mango")]).compositor(), "mango");
+        assert_eq!(session(&[("UMBRIEL_SOCKET", "/u")]).compositor(), "umbriel");
+        assert_eq!(session(&[("XDG_CURRENT_DESKTOP", "umbriel")]).compositor(), "umbriel");
+        assert_eq!(session(&[("NIRI_SOCKET", "/n"), ("UMBRIEL_SOCKET", "/u")]).compositor(), "niri");
+        assert_eq!(session(&[("UMBRIEL_SOCKET", "/u"), ("SWAYSOCK", "/s")]).compositor(), "umbriel");
         assert_eq!(session(&[("HYPRLAND_INSTANCE_SIGNATURE", "x")]).compositor(), "hyprland");
         assert_eq!(session(&[("SWAYSOCK", "")]).compositor(), "unknown");
         assert_eq!(session(&[("HOME", "/root")]).vars().len(), 0);

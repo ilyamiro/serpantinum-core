@@ -39,8 +39,8 @@ Commands:
   sysinfo                       Print one sample of CPU, memory, temperature, network and disk usage
   watch sysinfo [--interval S]  Print a sample every S seconds (default 2) until stopped
   watch locks                   Print Caps Lock and Num Lock now and on every change
-  watch compositor              Print the workspaces, windows and keyboard layout of Sway, Niri or
-                                Mango now and on every change
+  watch compositor              Print the workspaces, windows and keyboard layout of Sway, Niri,
+                                Mango or Umbriel now and on every change
   watch brightness              Print the brightness in percent and its backend now and on every change
   watch network                 Print NetworkManager's connectivity and every interface's first IPv4
                                 address and Wi-Fi frequency in MHz now and on every change

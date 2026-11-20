@@ -1,6 +1,6 @@
-//! The outputs that show something, for the shell's monitor lists: asked of Mango, Hyprland, Niri
-//! or Sway over its socket, else of any Wayland compositor through wl_output, else read from the
-//! connectors the kernel reports connected.
+//! The outputs that show something, for the shell's monitor lists: asked of Mango, Umbriel,
+//! Hyprland, Niri or Sway over its socket, else of any Wayland compositor through wl_output, else
+//! read from the connectors the kernel reports connected.
 
 use std::path::Path;
 
@@ -9,7 +9,7 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 
-use crate::compositor::{Session, hyprland, mango, niri, sway};
+use crate::compositor::{Session, hyprland, mango, niri, sway, umbriel};
 
 /// Refresh rate when the source does not tell one
 const DEFAULT_REFRESH: f64 = 60.0;
@@ -43,8 +43,9 @@ fn rate(hz: f64) -> Json {
 
 /// The first source that knows of any output
 pub fn list(session: &Session) -> Vec<Monitor> {
-    let sources: [&dyn Fn() -> Vec<Monitor>; 6] = [
+    let sources: [&dyn Fn() -> Vec<Monitor>; 7] = [
         &|| mango::request(session, "get all-monitors").map(|r| from_mango(&r)).unwrap_or_default(),
+        &|| umbriel::request(session, &json!({"cmd": "outputs"})).map(|r| from_umbriel(&r)).unwrap_or_default(),
         &|| hyprland::request(session, "j/monitors").map(|r| from_hyprland(&r)).unwrap_or_default(),
         &|| niri::request(session, "Outputs").map(|r| from_niri(&r)).unwrap_or_default(),
         &|| sway::ask(session, sway::GET_OUTPUTS).map(|r| from_sway(&r)).unwrap_or_default(),
@@ -75,6 +76,22 @@ pub fn from_mango(reply: &Json) -> Vec<Monitor> {
                 width: int(m, "width"),
                 height: int(m, "height"),
                 refresh: DEFAULT_REFRESH,
+            })
+        })
+        .collect()
+}
+
+/// An `outputs` reply, of which the enabled outputs count, in their current mode
+pub fn from_umbriel(reply: &Json) -> Vec<Monitor> {
+    items(Some(reply))
+        .filter(|o| o.get("enabled") == Some(&Json::Bool(true)))
+        .filter_map(|o| {
+            let mode = items(o.get("modes")).find(|m| m.get("current") == Some(&Json::Bool(true)));
+            Some(Monitor {
+                name: named(o)?,
+                width: mode.and_then(|m| int(m, "width")),
+                height: mode.and_then(|m| int(m, "height")),
+                refresh: mode.and_then(|m| m.get("refresh_mhz")?.as_f64()).map_or(DEFAULT_REFRESH, |mhz| mhz / 1000.0),
             })
         })
         .collect()
@@ -256,6 +273,20 @@ mod tests {
             [monitor("HEADLESS-1", 1280, 720, 60.0), monitor("HEADLESS-2", 1920, 1080, 60.0)]
         );
         assert!(from_mango(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn umbriel_lists_the_enabled_outputs_in_their_current_mode() {
+        let reply = json!([
+            {"name": "DP-1", "enabled": true, "powered": true, "focused": true, "scale": 1.0, "modes": [
+                {"width": 3840, "height": 2160, "refresh_mhz": 60000, "preferred": true, "current": false},
+                {"width": 2560, "height": 1440, "refresh_mhz": 143912, "preferred": false, "current": true}]},
+            {"name": "HDMI-A-1", "enabled": false, "modes": [
+                {"width": 1920, "height": 1080, "refresh_mhz": 60000, "preferred": true, "current": false}]},
+            {"name": "HEADLESS-1", "enabled": true, "modes": [
+                {"width": 1280, "height": 720, "refresh_mhz": 0, "preferred": false, "current": true}]}]);
+        assert_eq!(from_umbriel(&reply), [monitor("DP-1", 2560, 1440, 143.912), monitor("HEADLESS-1", 1280, 720, 0.0)]);
+        assert!(from_umbriel(&json!({"err": "unknown command: outputs"})).is_empty());
     }
 
     #[test]

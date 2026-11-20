@@ -14,7 +14,7 @@ serpantinum-core start                        # the daemon, in the background
 serpantinum-core sysinfo                      # one sample
 serpantinum-core watch sysinfo --interval 2   # a sample every 2 seconds until stopped
 serpantinum-core watch locks                  # Caps Lock and Num Lock, now and on every change
-serpantinum-core watch compositor             # Sway, Niri or Mango workspaces, windows and layout
+serpantinum-core watch compositor             # Sway, Niri, Mango or Umbriel workspaces, windows and layout
 serpantinum-core watch brightness             # brightness in percent and its backend
 serpantinum-core watch network                # connectivity, IPv4 addresses and Wi-Fi frequencies
 serpantinum-core brightness set 40            # also get, raise, lower and backend
@@ -48,10 +48,10 @@ members of the `input` group, and nothing runs between changes. Otherwise the LE
 there. On Hyprland every change is checked against Hyprland's main keyboard, which ignores LED
 flicker from other keyboards.
 
-The compositor feed speaks each compositor's own socket: Sway's i3-ipc, Niri's JSON socket and
-Mango's IPC socket, so following them costs no processes. Every watcher passes the variables that
-locate its compositor, because the daemon may outlive a login. Of Hyprland, which the shell reads
-natively, only the focused window is followed, for screen time.
+The compositor feed speaks each compositor's own socket: Sway's i3-ipc, Niri's JSON socket,
+Mango's IPC socket and Umbriel's, so following them costs no processes. Every watcher passes the
+variables that locate its compositor, because the daemon may outlive a login. Of Hyprland, which the
+shell reads natively, only the focused window is followed, for screen time.
 
 `monitors` asks the same sockets, and Hyprland's, for the outputs in use. On other compositors it
 asks for the Wayland outputs (`wl_output` 4 or later), and without a compositor it lists the
