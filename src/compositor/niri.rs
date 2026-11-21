@@ -205,7 +205,15 @@ impl Niri {
             return Err(io::Error::other(format!("niri refused the event stream: {reply}")));
         }
         events.stream.set_read_timeout(None)?;
-        Ok(Niri { events, model: Model::default() })
+        // niri answers the request and sends the whole state in one go, so what came with the
+        // reply is applied now instead of waiting for the next event to wake the follower
+        let mut model = Model::default();
+        for line in events.remaining() {
+            if let Ok(event) = serde_json::from_str::<Json>(&line) {
+                model.apply(&event);
+            }
+        }
+        Ok(Niri { events, model })
     }
 }
 
@@ -284,6 +292,24 @@ mod tests {
         assert!(windows.as_object().unwrap().values().all(|w| w["is_focused"] == false));
         assert!(windows.get("6").is_none());
         assert_eq!(model.state().workspaces["occupiedMap"], json!({"0": true, "1": true}));
+    }
+
+    #[test]
+    fn initial_burst_gives_named_layouts() {
+        // What niri sends right after the EventStream reply: applied at connect, so the shell gets
+        // the layout names before anything else happens
+        let mut model = Model::default();
+        for event in [
+            json!({"WorkspacesChanged": {"workspaces": []}}),
+            json!({"WindowsChanged": {"windows": []}}),
+            json!({"KeyboardLayoutsChanged": {"keyboard_layouts": {"names": ["English (US)", "Russian"], "current_idx": 1}}}),
+        ] {
+            model.apply(&event);
+        }
+        assert_eq!(
+            model.state().keyboard,
+            json!({"layout": "Russian", "layouts": ["English (US)", "Russian"], "index": 1})
+        );
     }
 
     #[test]
