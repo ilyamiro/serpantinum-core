@@ -11,7 +11,7 @@ pub mod niri;
 pub mod sway;
 pub mod umbriel;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -143,11 +143,12 @@ fn unix(path: impl AsRef<std::path::Path>) -> io::Result<UnixStream> {
 pub struct Lines {
     pub stream: UnixStream,
     pending: Vec<u8>,
+    ready: VecDeque<String>,
 }
 
 impl Lines {
     pub fn new(stream: UnixStream) -> Lines {
-        Lines { stream, pending: Vec::new() }
+        Lines { stream, pending: Vec::new(), ready: VecDeque::new() }
     }
 
     pub fn fd(&self) -> RawFd {
@@ -156,29 +157,41 @@ impl Lines {
 
     /// One read, and the complete lines it finished
     pub fn read(&mut self) -> io::Result<Vec<String>> {
-        let mut buf = [0u8; 16384];
-        let n = loop {
-            match self.stream.read(&mut buf) {
-                Ok(0) => return Err(closed()),
-                Ok(n) => break n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        };
-        self.pending.extend_from_slice(&buf[..n]);
-        Ok(split_lines(&mut self.pending))
+        if self.ready.is_empty() {
+            let mut buf = [0u8; 16384];
+            let n = loop {
+                match self.stream.read(&mut buf) {
+                    Ok(0) => return Err(closed()),
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            };
+            self.pending.extend_from_slice(&buf[..n]);
+            self.ready.extend(split_lines(&mut self.pending));
+        }
+        Ok(self.ready.drain(..).collect())
     }
 
-    /// Reads until a whole line arrives
+    /// The lines that arrived together with the last `read_line` and have not been read yet
+    pub fn remaining(&mut self) -> Vec<String> {
+        self.ready.drain(..).collect()
+    }
+
+    /// Reads until a whole line arrives. Whatever else came with it stays queued, ready for the
+    /// next call, so a reply and the events sent with it are not lost.
     pub fn read_line(&mut self) -> io::Result<String> {
         loop {
-            if let Some(line) = split_lines(&mut self.pending).into_iter().next() {
+            if let Some(line) = self.ready.pop_front() {
                 return Ok(line);
             }
             let mut buf = [0u8; 16384];
             match self.stream.read(&mut buf)? {
                 0 => return Err(closed()),
-                n => self.pending.extend_from_slice(&buf[..n]),
+                n => {
+                    self.pending.extend_from_slice(&buf[..n]);
+                    self.ready.extend(split_lines(&mut self.pending));
+                }
             }
         }
     }
@@ -269,6 +282,16 @@ mod tests {
         assert_eq!(split_lines(&mut pending), ["one", "two"]);
         assert_eq!(pending, b"thr");
         assert!(split_lines(&mut pending).is_empty());
+    }
+
+    #[test]
+    fn read_line_keeps_the_lines_that_came_with_it() {
+        use std::io::Write;
+        let (mut peer, stream) = UnixStream::pair().unwrap();
+        let mut lines = Lines::new(stream);
+        peer.write_all(b"{\"Ok\":\"Handled\"}\n{\"KeyboardLayoutsChanged\":{}}\n{\"X\":1}\n").unwrap();
+        assert_eq!(lines.read_line().unwrap(), "{\"Ok\":\"Handled\"}");
+        assert_eq!(lines.remaining(), ["{\"KeyboardLayoutsChanged\":{}}", "{\"X\":1}"]);
     }
 
     #[test]
