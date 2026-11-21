@@ -15,6 +15,7 @@ use zbus::{fdo, interface};
 use crate::brightness::{self, Backend, Change, Ddc};
 use crate::clipboard;
 use crate::compositor::{self, Session, Waker};
+use crate::history::{self, History};
 use crate::idle::{self, Event, Inhibition, SleepLock};
 use crate::leases::Leases;
 use crate::locks::{self, Locks};
@@ -43,6 +44,7 @@ pub const NETWORK_INTERFACE: &str = "org.serpantinum.Core.Network";
 const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
 const MIN_INTERVAL: Duration = Duration::from_millis(100);
 const PRIMING: Duration = Duration::from_millis(250);
+const HISTORY_STEP: Duration = Duration::from_secs(1);
 const DEVICE_SETTLE: Duration = Duration::from_millis(500);
 /// How long to wait before connecting again to a compositor that went away
 const RECONNECT: Duration = Duration::from_secs(1);
@@ -97,14 +99,42 @@ impl SysState {
     }
 }
 
+struct HistoryState {
+    history: History,
+    next_sample: Instant,
+}
+
 pub struct SysFeed {
     pub leases: Leases,
     state: Mutex<SysState>,
+    history: Mutex<HistoryState>,
 }
 
 impl SysFeed {
     pub fn new() -> Arc<SysFeed> {
-        Arc::new(SysFeed { leases: Leases::default(), state: Mutex::default() })
+        Arc::new(SysFeed {
+            leases: Leases::default(),
+            state: Mutex::default(),
+            history: Mutex::new(HistoryState { history: History::default(), next_sample: Instant::now() }),
+        })
+    }
+
+    /// Adds a sample to the history every second, forever, leased or not
+    pub fn run_history(&self) {
+        let mut sampler = Sampler::system();
+        sampler.load();
+        let mut next = Instant::now() + HISTORY_STEP;
+        loop {
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            let load = sampler.load();
+            next += HISTORY_STEP;
+            if next < Instant::now() {
+                next = Instant::now() + HISTORY_STEP;
+            }
+            let mut state = self.history.lock().unwrap();
+            state.history.push(load);
+            state.next_sample = next;
+        }
     }
 
     /// Samples at the shortest interval leased, forever
@@ -1010,6 +1040,18 @@ impl SysInfo {
     fn unsubscribe(&self, #[zbus(header)] header: Header<'_>) -> fdo::Result<()> {
         self.0.leases.remove(&owner(&header)?);
         Ok(())
+    }
+
+    /// The newest `count` averages over `step` seconds of CPU, memory and temperature as JSON, and
+    /// the milliseconds until the next one completes
+    fn history(&self, step: u32, count: u32) -> (String, u32) {
+        let step = step.clamp(1, 60) as usize;
+        let count = (count as usize).min(history::CAPACITY);
+        let state = self.0.history.lock().unwrap();
+        let ahead = state.history.samples_until_bucket(step).saturating_sub(1);
+        let wait = state.next_sample.saturating_duration_since(Instant::now()) + HISTORY_STEP * ahead as u32;
+        let json = state.history.series(step, count).json().to_string();
+        (json, u32::try_from(wait.as_millis()).unwrap_or(u32::MAX))
     }
 
     #[zbus(property)]

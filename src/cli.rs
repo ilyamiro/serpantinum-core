@@ -38,6 +38,11 @@ Commands:
   quit                          Stop the daemon
   sysinfo                       Print one sample of CPU, memory, temperature, network and disk usage
   watch sysinfo [--interval S]  Print a sample every S seconds (default 2) until stopped
+  watch history [--interval S] [--count N]
+                                Print the last N (default 60) averages over S whole seconds (default
+                                2, at most 60) of CPU, memory and temperature, now and whenever
+                                another completes. The daemon samples them every second from its
+                                start, so the series is full at once
   watch locks                   Print Caps Lock and Num Lock now and on every change
   watch compositor              Print the workspaces, windows and keyboard layout of Sway, Niri,
                                 Mango or Umbriel now and on every change
@@ -95,6 +100,8 @@ Options:
 const WAIT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
+/// Asks a little after a bucket should complete, so the sample is there
+const HISTORY_MARGIN: Duration = Duration::from_millis(50);
 const LOCKS_INTERVAL: Duration = Duration::from_millis(250);
 /// Properties served as JSON text, printed as the JSON they hold
 const JSON_PROPERTIES: &[&str] = &["Workspaces", "Windows", "Keyboard", "Interfaces"];
@@ -179,7 +186,7 @@ fn command(args: &[String]) -> Result<()> {
         return notify_command(rest);
     }
     let (positional, options) = options(args)?;
-    if let Some(name) = options.keys().find(|n| !matches!(**n, "interval" | "cache-dir" | "app" | "db-dir")) {
+    if let Some(name) = options.keys().find(|n| !matches!(**n, "interval" | "count" | "cache-dir" | "app" | "db-dir")) {
         return Err(usage(format!("unknown option --{name}")));
     }
     match positional.as_slice() {
@@ -193,6 +200,19 @@ fn command(args: &[String]) -> Result<()> {
             }
             .ok_or_else(|| usage("--interval takes a number of seconds"))?;
             watch(SYSINFO_PATH, SYSINFO_INTERFACE, Lease::Every(Duration::from_secs_f64(seconds)))
+        }
+        ["watch", "history"] => {
+            let step = match options.get("interval") {
+                Some(text) => text.parse::<u32>().ok().filter(|s| (1..=60).contains(s)),
+                None => Some(2),
+            }
+            .ok_or_else(|| usage("--interval takes whole seconds from 1 to 60"))?;
+            let count = match options.get("count") {
+                Some(text) => text.parse::<u32>().ok().filter(|n| *n > 0),
+                None => Some(60),
+            }
+            .ok_or_else(|| usage("--count takes a positive number"))?;
+            watch_history(step, count)
         }
         ["watch", "locks"] => watch(LOCKS_PATH, LOCKS_INTERFACE, Lease::Every(LOCKS_INTERVAL)),
         ["watch", "compositor"] => watch(COMPOSITOR_PATH, COMPOSITOR_INTERFACE, Lease::Session),
@@ -488,6 +508,31 @@ fn watch(path: &'static str, interface: &'static str, lease: Lease) -> Result<()
         }
     }
     Err(failed("lost the session bus"))
+}
+
+/// Prints the history series now and each time a bucket completes. When the daemon goes away it is
+/// started again.
+fn watch_history(step: u32, count: u32) -> Result<()> {
+    let conn = connect()?;
+    start(&conn)?;
+    let mut last = String::new();
+    loop {
+        let reply = Proxy::new(&conn, BUS_NAME, SYSINFO_PATH, SYSINFO_INTERFACE)
+            .and_then(|proxy| proxy.call::<_, _, (String, u32)>("History", &(step, count)));
+        match reply {
+            Ok((series, wait)) => {
+                if series != last {
+                    print(&series);
+                    last = series;
+                }
+                sleep(Duration::from_millis(wait.into()) + HISTORY_MARGIN);
+            }
+            Err(_) => {
+                sleep(RESTART_DELAY);
+                start(&conn)?;
+            }
+        }
+    }
 }
 
 /// The shell's idle helper protocol on stdin and stdout, served by the daemon while this runs

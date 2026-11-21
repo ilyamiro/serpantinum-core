@@ -13,6 +13,7 @@ bus. The binary links only glibc.
 serpantinum-core start                        # the daemon, in the background
 serpantinum-core sysinfo                      # one sample
 serpantinum-core watch sysinfo --interval 2   # a sample every 2 seconds until stopped
+serpantinum-core watch history --interval 2   # the last 60 two-second averages, then each new one
 serpantinum-core watch locks                  # Caps Lock and Num Lock, now and on every change
 serpantinum-core watch compositor             # Sway, Niri, Mango or Umbriel workspaces, windows and layout
 serpantinum-core watch brightness             # brightness in percent and its backend

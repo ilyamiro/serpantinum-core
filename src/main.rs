@@ -3,6 +3,7 @@ mod cli;
 mod clipboard;
 mod compositor;
 mod dbus;
+mod history;
 mod idle;
 mod launcher;
 mod leases;
@@ -97,6 +98,10 @@ fn run() -> Result<Outcome, String> {
     {
         let (feed, bus) = (sysinfo.clone(), bus.clone());
         std::thread::spawn(move || feed.run(&bus));
+    }
+    {
+        let feed = sysinfo.clone();
+        std::thread::spawn(move || feed.run_history());
     }
     {
         let (feed, bus) = (locks.clone(), bus.clone());

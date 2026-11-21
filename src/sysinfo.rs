@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::history::Load;
+
 const DISK_REFRESH: Duration = Duration::from_secs(60);
 const EXCLUDED_FS: &[&str] = &["tmpfs", "devtmpfs", "squashfs", "overlay", "efivarfs", "iso9660"];
 const TEMP_DRIVERS: &[&str] = &["coretemp", "k10temp", "zenpower", "cpu_thermal", "bcm2835_thermal"];
@@ -202,13 +204,25 @@ impl Sampler {
         std::fs::read_to_string(self.proc_root.join(name)).unwrap_or_default()
     }
 
-    pub fn sample(&mut self, now: Instant) -> Usage {
+    fn cpu(&mut self) -> u32 {
         let cpu_times = parse_cpu_times(&self.read("stat"));
         let cpu = match (self.previous_cpu, cpu_times) {
             (Some(prev), Some(cur)) => cpu_usage_percent(prev, cur),
             _ => 0,
         };
         self.previous_cpu = cpu_times.or(self.previous_cpu);
+        cpu
+    }
+
+    /// CPU, memory and temperature only, which is what the history keeps
+    pub fn load(&mut self) -> Load {
+        let cpu = self.cpu();
+        let (ram_percent, ram_gb) = parse_memory(&self.read("meminfo"));
+        Load { cpu, ram_percent, ram_gb, temp: read_temperature(self.temperature_path.as_deref()) }
+    }
+
+    pub fn sample(&mut self, now: Instant) -> Usage {
+        let cpu = self.cpu();
 
         let (rx, tx) = parse_net_totals(&self.read("net/dev"));
         let (net_rx, net_tx) = match self.previous_net {
